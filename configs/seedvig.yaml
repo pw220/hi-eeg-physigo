@@ -1,0 +1,27 @@
+data_root: data/raw/SEED-VIG
+processed_root: data/processed/SEED-VIG
+
+feature_set: EEG_Feature_5Bands
+label_set: perclos_labels
+
+labeling:
+  task: binary
+  alert_max: 0.35
+  fatigue_min: 0.70
+  discard_middle: true
+
+evaluation:
+  protocol: loso
+  target_uses_unlabeled_windows_for_adaptation: true
+
+metrics:
+  classification:
+    - balanced_accuracy
+    - macro_f1
+    - auroc
+  regression:
+    - rmse
+    - mae
+    - pearson
+    - spearman
+

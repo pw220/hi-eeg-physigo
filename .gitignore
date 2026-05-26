@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Generated experiments and logs
+outputs/
+results/
+checkpoints/
+logs/
+wandb/
+.ipynb_checkpoints/
+
+# Model artifacts and arrays
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+
+# MATLAB datasets and SEED-VIG local data
+*.mat
+Raw_Data/
+perclos_labels/
+data/raw/
+data/processed/
+data/external/
+data/interim/
