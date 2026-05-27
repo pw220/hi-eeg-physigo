@@ -60,12 +60,39 @@ One-fold CPU smoke test:
 python train_eegnet_source.py --target-subject 1 --epochs 1 --batch-size 64 --device cpu --label-mode threshold35 --class-balance weighted_loss
 ```
 
+Configurable one-fold training example. The backbone remains the faithful ARL EEGNet-8,2 port; pooling is fixed at `(1, 4)` then `(1, 8)` to match the original architecture.
+
+```bash
+python train_eegnet_source.py \
+  --target-subject 1 \
+  --epochs 50 \
+  --batch-size 64 \
+  --lr 1e-3 \
+  --optimizer adamw \
+  --weight-decay 1e-4 \
+  --early-stop-patience 15 \
+  --monitor-metric macro_f1 \
+  --lr-scheduler plateau \
+  --eegnet-f1 8 \
+  --eegnet-d 2 \
+  --eegnet-f2 0 \
+  --eegnet-temporal-kernel 64 \
+  --eegnet-separable-kernel 16 \
+  --eegnet-pool1 4 \
+  --eegnet-pool2 8 \
+  --eegnet-dropout 0.5 \
+  --eegnet-norm-rate 0.25 \
+  --device cuda \
+  --label-mode threshold35 \
+  --class-balance weighted_loss
+```
+
 Do not run full LOSO or long training locally unless you have suitable hardware.
 
 ## Full GPU LOSO Command
 
 ```bash
-python train_eegnet_source.py --run-all-loso --epochs 100 --batch-size 64 --device cuda --label-mode threshold35 --class-balance weighted_loss
+python train_eegnet_source.py --run-all-loso --epochs 100 --batch-size 64 --device cuda --label-mode threshold35 --class-balance weighted_loss --optimizer adamw --weight-decay 0.0001 --early-stop-patience 15 --monitor-metric macro_f1 --lr-scheduler plateau
 ```
 
 ## Google Colab Usage
@@ -77,6 +104,10 @@ python train_eegnet_source.py \
   --target-subject 1 \
   --epochs 5 \
   --batch-size 64 \
+  --optimizer adamw \
+  --weight-decay 1e-4 \
+  --early-stop-patience 15 \
+  --monitor-metric macro_f1 \
   --device cuda \
   --label-mode threshold35 \
   --class-balance weighted_loss \
@@ -92,6 +123,11 @@ python train_eegnet_source.py \
   --run-all-loso \
   --epochs 100 \
   --batch-size 64 \
+  --optimizer adamw \
+  --weight-decay 1e-4 \
+  --early-stop-patience 15 \
+  --monitor-metric macro_f1 \
+  --lr-scheduler plateau \
   --device cuda \
   --label-mode threshold35 \
   --class-balance weighted_loss \

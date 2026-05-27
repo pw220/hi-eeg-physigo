@@ -76,9 +76,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--optimizer", choices=("adam", "adamw", "sgd"), default="adam")
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--grad-clip-norm", type=float, default=0.0)
+    parser.add_argument("--lr-scheduler", choices=("none", "plateau"), default="none")
+    parser.add_argument("--plateau-factor", type=float, default=0.5)
+    parser.add_argument("--plateau-patience", type=int, default=5)
+    parser.add_argument("--min-lr", type=float, default=1e-6)
+    parser.add_argument("--early-stop-patience", type=int, default=0)
+    parser.add_argument("--min-delta", type=float, default=0.0)
+    parser.add_argument("--monitor-metric", choices=("macro_f1", "balanced_accuracy"), default="macro_f1")
     parser.add_argument("--val-subject-ratio", type=float, default=0.2)
     parser.add_argument("--bandpass", action="store_true")
     parser.add_argument("--robust-clip", action="store_true")
+    parser.add_argument("--eegnet-f1", type=int, default=8)
+    parser.add_argument("--eegnet-d", type=int, default=2)
+    parser.add_argument("--eegnet-f2", type=int, default=0, help="0 means f1*d")
+    parser.add_argument("--eegnet-temporal-kernel", type=int, default=64)
+    parser.add_argument("--eegnet-separable-kernel", type=int, default=16)
+    parser.add_argument("--eegnet-pool1", type=int, default=4)
+    parser.add_argument("--eegnet-pool2", type=int, default=8)
+    parser.add_argument("--eegnet-dropout", type=float, default=0.5)
+    parser.add_argument("--eegnet-norm-rate", type=float, default=0.25)
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--outputs-dir", dest="output_dir", help=argparse.SUPPRESS)
     parser.add_argument("--save-latest", action="store_true")
@@ -97,6 +117,7 @@ def main() -> None:
         raise ValueError("--skip-existing and --overwrite are mutually exclusive")
     if (args.raw_data_dir is None) != (args.label_dir is None):
         raise ValueError("--raw-data-dir and --label-dir must be provided together")
+    validate_training_args(args)
     set_seed(args.seed)
     outputs_dir = Path(args.output_dir)
     outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -182,6 +203,43 @@ def resolve_target_subjects(args: argparse.Namespace, subjects: list[int]) -> li
     return [args.target_subject]
 
 
+def validate_training_args(args: argparse.Namespace) -> None:
+    if args.epochs <= 0:
+        raise ValueError("--epochs must be positive")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if args.lr <= 0:
+        raise ValueError("--lr must be positive")
+    if args.weight_decay < 0:
+        raise ValueError("--weight-decay must be non-negative")
+    if args.grad_clip_norm < 0:
+        raise ValueError("--grad-clip-norm must be non-negative")
+    if args.early_stop_patience < 0:
+        raise ValueError("--early-stop-patience must be non-negative")
+    if args.min_delta < 0:
+        raise ValueError("--min-delta must be non-negative")
+    if not 0.0 < args.plateau_factor < 1.0:
+        raise ValueError("--plateau-factor must be between 0 and 1")
+    if args.plateau_patience < 0:
+        raise ValueError("--plateau-patience must be non-negative")
+    if args.min_lr < 0:
+        raise ValueError("--min-lr must be non-negative")
+    if args.eegnet_f1 <= 0 or args.eegnet_d <= 0:
+        raise ValueError("--eegnet-f1 and --eegnet-d must be positive")
+    if args.eegnet_f2 < 0:
+        raise ValueError("--eegnet-f2 must be non-negative; use 0 for f1*d")
+    if args.eegnet_temporal_kernel <= 0 or args.eegnet_separable_kernel <= 0:
+        raise ValueError("EEGNet kernel sizes must be positive")
+    if args.eegnet_pool1 <= 0 or args.eegnet_pool2 <= 0:
+        raise ValueError("EEGNet pool sizes must be positive")
+    if args.eegnet_pool1 != 4 or args.eegnet_pool2 != 8:
+        raise ValueError("Faithful EEGNet-8,2 uses fixed pool sizes: --eegnet-pool1 4 --eegnet-pool2 8")
+    if not 0.0 <= args.eegnet_dropout < 1.0:
+        raise ValueError("--eegnet-dropout must be in [0, 1)")
+    if args.eegnet_norm_rate <= 0:
+        raise ValueError("--eegnet-norm-rate must be positive")
+
+
 def make_run_id(args: argparse.Namespace, target_subject: int) -> str:
     base = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     return f"{base}_subject{target_subject}"
@@ -234,9 +292,29 @@ def plan_loso_fold(
         f"--target-subject {target_subject} "
         f"--epochs {args.epochs} "
         f"--batch-size {args.batch_size} "
+        f"--lr {args.lr} "
+        f"--optimizer {args.optimizer} "
+        f"--weight-decay {args.weight_decay} "
+        f"--grad-clip-norm {args.grad_clip_norm} "
+        f"--lr-scheduler {args.lr_scheduler} "
+        f"--plateau-factor {args.plateau_factor} "
+        f"--plateau-patience {args.plateau_patience} "
+        f"--min-lr {args.min_lr} "
+        f"--early-stop-patience {args.early_stop_patience} "
+        f"--min-delta {args.min_delta} "
+        f"--monitor-metric {args.monitor_metric} "
         f"--device {args.device} "
         f"--label-mode {args.label_mode} "
         f"--class-balance {args.class_balance} "
+        f"--eegnet-f1 {args.eegnet_f1} "
+        f"--eegnet-d {args.eegnet_d} "
+        f"--eegnet-f2 {args.eegnet_f2} "
+        f"--eegnet-temporal-kernel {args.eegnet_temporal_kernel} "
+        f"--eegnet-separable-kernel {args.eegnet_separable_kernel} "
+        f"--eegnet-pool1 {args.eegnet_pool1} "
+        f"--eegnet-pool2 {args.eegnet_pool2} "
+        f"--eegnet-dropout {args.eegnet_dropout} "
+        f"--eegnet-norm-rate {args.eegnet_norm_rate} "
         f"--output-dir {shlex.quote(str(args.output_dir))}"
     )
     if args.raw_data_dir is not None and args.label_dir is not None:
@@ -332,36 +410,65 @@ def run_loso_fold(
     print_class_balance(train["y"], args.class_balance, class_weights)
     criterion_weight = None if class_weights is None else torch.tensor(class_weights, dtype=torch.float32, device=device)
 
-    model = EEGNet(channels=17, samples=1600, num_classes=2).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    model_config = eegnet_model_config(args)
+    print_model_and_training_config(args, model_config)
+    model = EEGNet(**model_config).to(device)
+    optimizer = make_optimizer(model, args)
+    scheduler = make_scheduler(optimizer, args)
     criterion = nn.CrossEntropyLoss(weight=criterion_weight)
 
     best_state = None
     best_epoch = 0
+    best_monitor = -1.0
+    best_tie = -1.0
     best_macro_f1 = -1.0
     best_balanced_acc = -1.0
+    epochs_without_improvement = 0
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        train_loss = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+            grad_clip_norm=args.grad_clip_norm,
+        )
         val_logits, val_y = predict_logits(model, val_loader, device)
         val_pred = val_logits.argmax(axis=1)
         val_metrics = classification_metrics(val_y, val_pred)
-        improved = (
-            val_metrics["macro_f1"] > best_macro_f1
-            or (
-                np.isclose(val_metrics["macro_f1"], best_macro_f1)
-                and val_metrics["balanced_accuracy"] > best_balanced_acc
-            )
+        monitor_value = float(val_metrics[args.monitor_metric])
+        tie_metric = "balanced_accuracy" if args.monitor_metric == "macro_f1" else "macro_f1"
+        tie_value = float(val_metrics[tie_metric])
+        improved = monitor_value > best_monitor + args.min_delta or (
+            np.isclose(monitor_value, best_monitor) and tie_value > best_tie + args.min_delta
         )
         if improved:
             best_epoch = epoch
+            best_monitor = monitor_value
+            best_tie = tie_value
             best_macro_f1 = float(val_metrics["macro_f1"])
             best_balanced_acc = float(val_metrics["balanced_accuracy"])
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+        if scheduler is not None:
+            scheduler.step(monitor_value)
+        current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"target_subject={plan.target_subject} epoch={epoch:03d} train_loss={train_loss:.4f} "
             f"val_macro_f1={val_metrics['macro_f1']:.4f} "
-            f"val_bal_acc={val_metrics['balanced_accuracy']:.4f}"
+            f"val_bal_acc={val_metrics['balanced_accuracy']:.4f} "
+            f"monitor={args.monitor_metric}:{monitor_value:.4f} "
+            f"lr={current_lr:.6g} "
+            f"no_improve={epochs_without_improvement}"
         )
+        if args.early_stop_patience > 0 and epochs_without_improvement >= args.early_stop_patience:
+            print(
+                f"early_stopping_triggered epoch={epoch} "
+                f"best_epoch={best_epoch} monitor_metric={args.monitor_metric} best_monitor={best_monitor:.4f}"
+            )
+            break
 
     if best_state is None:
         raise RuntimeError("Training did not produce a best model")
@@ -374,13 +481,13 @@ def run_loso_fold(
     print_final_metrics(test_metrics)
 
     save_predictions(plan.prediction_path, test, test_y, test_pred, test_probs)
-    model_config = {"channels": 17, "samples": 1600, "num_classes": 2}
     checkpoint = {
         "run_id": plan.run_id,
         "created_at": plan.created_at,
         "command": plan.command,
         "model_state_dict": best_state,
         "model_config": model_config,
+        "training_config": training_config(args),
         "args": vars(args),
         "label_mode": args.label_mode,
         "target_subject": plan.target_subject,
@@ -420,7 +527,7 @@ def run_loso_fold(
         plan,
         status="success",
         best_epoch=best_epoch,
-        best_val_metric=best_macro_f1,
+        best_val_metric=best_macro_f1 if args.monitor_metric == "macro_f1" else best_balanced_acc,
         error="",
     )
     print(f"Saved predictions: {plan.prediction_path}")
@@ -500,6 +607,77 @@ def make_loader(arrays: dict[str, np.ndarray], batch_size: int, *, shuffle: bool
     )
 
 
+def eegnet_model_config(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "channels": 17,
+        "samples": 1600,
+        "num_classes": 2,
+        "F1": args.eegnet_f1,
+        "D": args.eegnet_d,
+        "F2": None if args.eegnet_f2 == 0 else args.eegnet_f2,
+        "kernLength": args.eegnet_temporal_kernel,
+        "separable_kernel_length": args.eegnet_separable_kernel,
+        "dropoutRate": args.eegnet_dropout,
+        "norm_rate": args.eegnet_norm_rate,
+    }
+
+
+def training_config(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "optimizer": args.optimizer,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "momentum": args.momentum,
+        "grad_clip_norm": args.grad_clip_norm,
+        "lr_scheduler": args.lr_scheduler,
+        "plateau_factor": args.plateau_factor,
+        "plateau_patience": args.plateau_patience,
+        "min_lr": args.min_lr,
+        "early_stop_patience": args.early_stop_patience,
+        "min_delta": args.min_delta,
+        "monitor_metric": args.monitor_metric,
+    }
+
+
+def print_model_and_training_config(args: argparse.Namespace, model_config: dict[str, object]) -> None:
+    print("model_config")
+    for key, value in model_config.items():
+        print(f"  {key}={value}")
+    print("training_config")
+    for key, value in training_config(args).items():
+        print(f"  {key}={value}")
+
+
+def make_optimizer(model: nn.Module, args: argparse.Namespace) -> torch.optim.Optimizer:
+    if args.optimizer == "adam":
+        return torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == "adamw":
+        return torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == "sgd":
+        return torch.optim.SGD(
+            model.parameters(),
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+            nesterov=args.momentum > 0,
+        )
+    raise ValueError(f"Unsupported optimizer: {args.optimizer}")
+
+
+def make_scheduler(optimizer: torch.optim.Optimizer, args: argparse.Namespace):
+    if args.lr_scheduler == "none":
+        return None
+    if args.lr_scheduler == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=args.plateau_factor,
+            patience=args.plateau_patience,
+            min_lr=args.min_lr,
+        )
+    raise ValueError(f"Unsupported lr scheduler: {args.lr_scheduler}")
+
+
 def compute_class_weights(y: np.ndarray, class_balance: str) -> np.ndarray | None:
     if class_balance == "none":
         return None
@@ -521,7 +699,15 @@ def print_class_balance(y: np.ndarray, class_balance: str, class_weights: np.nda
         print(f"  class_weights={{0: {class_weights[0]:.6f}, 1: {class_weights[1]:.6f}}}")
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device: torch.device) -> float:
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    criterion,
+    device: torch.device,
+    *,
+    grad_clip_norm: float,
+) -> float:
     model.train()
     total_loss = 0.0
     total_count = 0
@@ -532,7 +718,11 @@ def train_one_epoch(model, loader, optimizer, criterion, device: torch.device) -
         logits = model(x)
         loss = criterion(logits, y)
         loss.backward()
+        if grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         optimizer.step()
+        if hasattr(model, "apply_max_norm_constraints"):
+            model.apply_max_norm_constraints()
         total_loss += float(loss.item()) * len(y)
         total_count += len(y)
     return total_loss / max(total_count, 1)
@@ -631,7 +821,8 @@ def save_success_summary_row(
         "best_epoch": best_epoch,
         "best_val_macro_f1": best_macro_f1,
         "best_val_balanced_accuracy": best_balanced_acc,
-        "best_val_metric": best_macro_f1,
+        "best_val_metric": best_macro_f1 if args.monitor_metric == "macro_f1" else best_balanced_acc,
+        "monitor_metric": args.monitor_metric,
         "test_accuracy": metrics["accuracy"],
         "test_balanced_accuracy": metrics["balanced_accuracy"],
         "test_macro_f1": metrics["macro_f1"],
@@ -681,6 +872,19 @@ def write_checkpoint_manifest_row(
         "epochs": args.epochs,
         "best_epoch": best_epoch,
         "best_val_metric": best_val_metric,
+        "monitor_metric": args.monitor_metric,
+        "optimizer": args.optimizer,
+        "weight_decay": args.weight_decay,
+        "early_stop_patience": args.early_stop_patience,
+        "eegnet_f1": args.eegnet_f1,
+        "eegnet_d": args.eegnet_d,
+        "eegnet_f2": args.eegnet_f2,
+        "eegnet_temporal_kernel": args.eegnet_temporal_kernel,
+        "eegnet_separable_kernel": args.eegnet_separable_kernel,
+        "eegnet_pool1": args.eegnet_pool1,
+        "eegnet_pool2": args.eegnet_pool2,
+        "eegnet_dropout": args.eegnet_dropout,
+        "eegnet_norm_rate": args.eegnet_norm_rate,
         "checkpoint_path": str(plan.checkpoint_path),
         "prediction_csv_path": str(plan.prediction_path),
         "summary_path": str(plan.summary_path),
@@ -720,6 +924,22 @@ def base_summary_fields(args: argparse.Namespace, plan: FoldPlan) -> dict[str, o
         "lr": args.lr,
         "bandpass": args.bandpass,
         "robust_clip": args.robust_clip,
+        "optimizer": args.optimizer,
+        "weight_decay": args.weight_decay,
+        "grad_clip_norm": args.grad_clip_norm,
+        "lr_scheduler": args.lr_scheduler,
+        "early_stop_patience": args.early_stop_patience,
+        "min_delta": args.min_delta,
+        "monitor_metric": args.monitor_metric,
+        "eegnet_f1": args.eegnet_f1,
+        "eegnet_d": args.eegnet_d,
+        "eegnet_f2": args.eegnet_f2,
+        "eegnet_temporal_kernel": args.eegnet_temporal_kernel,
+        "eegnet_separable_kernel": args.eegnet_separable_kernel,
+        "eegnet_pool1": args.eegnet_pool1,
+        "eegnet_pool2": args.eegnet_pool2,
+        "eegnet_dropout": args.eegnet_dropout,
+        "eegnet_norm_rate": args.eegnet_norm_rate,
         "n_train_subjects": len(plan.train_subject_ids),
         "n_val_subjects": len(plan.val_subject_ids),
     }
@@ -727,7 +947,25 @@ def base_summary_fields(args: argparse.Namespace, plan: FoldPlan) -> dict[str, o
 
 def upsert_summary_row(path: Path, row: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    key_cols = ["label_mode", "target_subject", "seed", "class_balance"]
+    key_cols = [
+        "label_mode",
+        "target_subject",
+        "seed",
+        "class_balance",
+        "optimizer",
+        "lr",
+        "weight_decay",
+        "monitor_metric",
+        "eegnet_f1",
+        "eegnet_d",
+        "eegnet_f2",
+        "eegnet_temporal_kernel",
+        "eegnet_separable_kernel",
+        "eegnet_pool1",
+        "eegnet_pool2",
+        "eegnet_dropout",
+        "eegnet_norm_rate",
+    ]
     new_row = pd.DataFrame([row])
     if path.exists():
         summary = pd.read_csv(path)
@@ -752,6 +990,19 @@ def print_global_plan_header(args: argparse.Namespace, report: IntegrityReport, 
     print("global_loso_plan")
     print(f"  label_mode={args.label_mode}")
     print(f"  class_balance={args.class_balance}")
+    print(f"  optimizer={args.optimizer}")
+    print(f"  lr={args.lr}")
+    print(f"  weight_decay={args.weight_decay}")
+    print(f"  early_stop_patience={args.early_stop_patience}")
+    print(f"  monitor_metric={args.monitor_metric}")
+    print(
+        "  eegnet="
+        f"f1:{args.eegnet_f1},d:{args.eegnet_d},f2:{args.eegnet_f2},"
+        f"temporal_kernel:{args.eegnet_temporal_kernel},"
+        f"separable_kernel:{args.eegnet_separable_kernel},"
+        f"pool1:{args.eegnet_pool1},pool2:{args.eegnet_pool2},"
+        f"dropout:{args.eegnet_dropout},norm_rate:{args.eegnet_norm_rate}"
+    )
     print(f"  data_root={args.data_root}")
     print(f"  raw_data_dir={args.raw_data_dir}")
     print(f"  label_dir={args.label_dir}")
@@ -881,7 +1132,9 @@ def print_recommended_gpu_command() -> None:
     print("recommended_later_gpu_command")
     print(
         "python train_eegnet_source.py --run-all-loso --epochs 100 --batch-size 64 "
-        "--device cuda --label-mode threshold35 --class-balance weighted_loss"
+        "--device cuda --label-mode threshold35 --class-balance weighted_loss "
+        "--optimizer adamw --weight-decay 0.0001 --early-stop-patience 15 "
+        "--monitor-metric macro_f1 --lr-scheduler plateau"
     )
 
 

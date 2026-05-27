@@ -46,6 +46,10 @@ One-fold GPU test:
   --target-subject 1 \
   --epochs 5 \
   --batch-size 64 \
+  --optimizer adamw \
+  --weight-decay 1e-4 \
+  --early-stop-patience 15 \
+  --monitor-metric macro_f1 \
   --device cuda \
   --label-mode threshold35 \
   --class-balance weighted_loss \
@@ -61,6 +65,11 @@ Full LOSO GPU run:
   --run-all-loso \
   --epochs 100 \
   --batch-size 64 \
+  --optimizer adamw \
+  --weight-decay 1e-4 \
+  --early-stop-patience 15 \
+  --monitor-metric macro_f1 \
+  --lr-scheduler plateau \
   --device cuda \
   --label-mode threshold35 \
   --class-balance weighted_loss \

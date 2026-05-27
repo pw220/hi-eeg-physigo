@@ -32,6 +32,7 @@ def main() -> None:
         "train_subject_ids",
         "val_subject_ids",
         "model_config",
+        "training_config",
     ]
     print(f"checkpoint={checkpoint_path}")
     for field in fields:
