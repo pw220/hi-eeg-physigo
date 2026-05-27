@@ -54,6 +54,7 @@ class FoldPlan:
     latest_checkpoint_path: Path | None
     summary_path: Path
     fold_report_path: Path
+    val_metrics_path: Path
     manifest_path: Path
     run_id: str
     created_at: str
@@ -86,7 +87,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--early-stop-patience", type=int, default=0)
     parser.add_argument("--min-delta", type=float, default=0.0)
-    parser.add_argument("--monitor-metric", choices=("macro_f1", "balanced_accuracy"), default="macro_f1")
+    parser.add_argument(
+        "--monitor-metric",
+        choices=("macro_f1", "balanced_accuracy", "accuracy", "fatigue_f1", "roc_auc", "auprc"),
+        default="macro_f1",
+    )
     parser.add_argument("--val-subject-ratio", type=float, default=0.2)
     parser.add_argument("--bandpass", action="store_true")
     parser.add_argument("--robust-clip", action="store_true")
@@ -286,6 +291,7 @@ def plan_loso_fold(
     )
     summary_path = outputs_dir / f"eegnet_source_only_{args.label_mode}_summary.csv"
     fold_report_path = outputs_dir / f"loso_fold_integrity_{args.label_mode}_subject_{target_subject}.txt"
+    val_metrics_path = outputs_dir / f"val_metrics_{args.label_mode}_subject_{target_subject}.csv"
     manifest_path = outputs_dir / "checkpoints_manifest.csv"
     command = (
         "python train_eegnet_source.py "
@@ -341,6 +347,7 @@ def plan_loso_fold(
         latest_checkpoint_path=latest_checkpoint_path,
         summary_path=summary_path,
         fold_report_path=fold_report_path,
+        val_metrics_path=val_metrics_path,
         manifest_path=manifest_path,
         run_id=run_id,
         created_at=created_at,
@@ -434,12 +441,13 @@ def run_loso_fold(
             grad_clip_norm=args.grad_clip_norm,
         )
         val_logits, val_y = predict_logits(model, val_loader, device)
+        val_probs = softmax(val_logits)
         val_pred = val_logits.argmax(axis=1)
-        val_metrics = classification_metrics(val_y, val_pred)
-        monitor_value = float(val_metrics[args.monitor_metric])
+        val_metrics = classification_metrics(val_y, val_pred, val_probs[:, 1])
+        monitor_value = _monitor_value(val_metrics, args.monitor_metric)
         tie_metric = "balanced_accuracy" if args.monitor_metric == "macro_f1" else "macro_f1"
-        tie_value = float(val_metrics[tie_metric])
-        improved = monitor_value > best_monitor + args.min_delta or (
+        tie_value = _monitor_value(val_metrics, tie_metric)
+        improved = best_state is None or monitor_value > best_monitor + args.min_delta or (
             np.isclose(monitor_value, best_monitor) and tie_value > best_tie + args.min_delta
         )
         if improved:
@@ -473,11 +481,12 @@ def run_loso_fold(
     if best_state is None:
         raise RuntimeError("Training did not produce a best model")
     model.load_state_dict(best_state)
+    save_validation_subject_metrics(model, val, plan.val_metrics_path, device, args.batch_size, args.num_workers)
 
     test_logits, test_y = predict_logits(model, test_loader, device)
     test_probs = softmax(test_logits)
     test_pred = test_probs.argmax(axis=1)
-    test_metrics = classification_metrics(test_y, test_pred)
+    test_metrics = classification_metrics(test_y, test_pred, test_probs[:, 1])
     print_final_metrics(test_metrics)
 
     save_predictions(plan.prediction_path, test, test_y, test_pred, test_probs)
@@ -503,6 +512,7 @@ def run_loso_fold(
         "best_val_metric": {
             "macro_f1": best_macro_f1,
             "balanced_accuracy": best_balanced_acc,
+            args.monitor_metric: best_monitor,
         },
         "final_metrics": serializable_metrics(test_metrics),
     }
@@ -520,6 +530,7 @@ def run_loso_fold(
         best_epoch=best_epoch,
         best_macro_f1=best_macro_f1,
         best_balanced_acc=best_balanced_acc,
+        best_monitor=best_monitor,
     )
     write_checkpoint_manifest_row(
         plan.manifest_path,
@@ -527,7 +538,7 @@ def run_loso_fold(
         plan,
         status="success",
         best_epoch=best_epoch,
-        best_val_metric=best_macro_f1 if args.monitor_metric == "macro_f1" else best_balanced_acc,
+        best_val_metric=best_monitor,
         error="",
     )
     print(f"Saved predictions: {plan.prediction_path}")
@@ -535,6 +546,7 @@ def run_loso_fold(
     if plan.latest_checkpoint_path is not None:
         print(f"Saved latest checkpoint: {plan.latest_checkpoint_path}")
     print(f"Saved summary: {plan.summary_path}")
+    print(f"Saved validation metrics: {plan.val_metrics_path}")
 
 
 def choose_device(requested: str) -> torch.device:
@@ -740,6 +752,51 @@ def predict_logits(model, loader, device: torch.device) -> tuple[np.ndarray, np.
     return np.concatenate(logits_list, axis=0), np.concatenate(y_list, axis=0)
 
 
+def _monitor_value(metrics: dict[str, object], metric_name: str) -> float:
+    value = float(metrics[metric_name])
+    if np.isnan(value):
+        return -np.inf
+    return value
+
+
+def save_validation_subject_metrics(
+    model,
+    val: dict[str, np.ndarray],
+    path: Path,
+    device: torch.device,
+    batch_size: int,
+    num_workers: int,
+) -> None:
+    rows = []
+    for subject_id in sorted({int(subject) for subject in val["subject_id"]}):
+        mask = val["subject_id"] == subject_id
+        subject_arrays = {
+            "x": np.ascontiguousarray(val["x"][mask]),
+            "y": np.ascontiguousarray(val["y"][mask]),
+        }
+        loader = make_loader(subject_arrays, batch_size, shuffle=False, num_workers=num_workers)
+        logits, y_true = predict_logits(model, loader, device)
+        probs = softmax(logits)
+        y_pred = probs.argmax(axis=1)
+        metrics = classification_metrics(y_true, y_pred, probs[:, 1])
+        rows.append(
+            {
+                "val_subject": subject_id,
+                "accuracy": metrics["accuracy"],
+                "balanced_accuracy": metrics["balanced_accuracy"],
+                "macro_f1": metrics["macro_f1"],
+                "fatigue_recall": metrics["fatigue_recall"],
+                "alert_recall": metrics["alert_recall"],
+                "tn": metrics["tn"],
+                "fp": metrics["fp"],
+                "fn": metrics["fn"],
+                "tp": metrics["tp"],
+            }
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
 def save_predictions(path: Path, arrays: dict[str, np.ndarray], y_true, y_pred, probs) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     confidence = probs.max(axis=1)
@@ -802,6 +859,7 @@ def save_success_summary_row(
     best_epoch: int,
     best_macro_f1: float,
     best_balanced_acc: float,
+    best_monitor: float,
 ) -> None:
     row = {
         **base_summary_fields(args, plan),
@@ -810,6 +868,9 @@ def save_success_summary_row(
         "train_count": plan.train_counts["usable"],
         "val_count": plan.val_counts["usable"],
         "test_count": plan.test_counts["usable"],
+        "test_samples": plan.test_counts["usable"],
+        "alert_count": plan.test_counts["alert"],
+        "fatigue_count": plan.test_counts["fatigue"],
         "train_alert_count": plan.train_counts["alert"],
         "train_fatigue_count": plan.train_counts["fatigue"],
         "val_alert_count": plan.val_counts["alert"],
@@ -821,16 +882,37 @@ def save_success_summary_row(
         "best_epoch": best_epoch,
         "best_val_macro_f1": best_macro_f1,
         "best_val_balanced_accuracy": best_balanced_acc,
-        "best_val_metric": best_macro_f1 if args.monitor_metric == "macro_f1" else best_balanced_acc,
+        "best_val_metric": best_monitor,
         "monitor_metric": args.monitor_metric,
-        "test_accuracy": metrics["accuracy"],
-        "test_balanced_accuracy": metrics["balanced_accuracy"],
-        "test_macro_f1": metrics["macro_f1"],
-        "test_precision": metrics["precision"],
-        "test_recall": metrics["recall"],
+        "accuracy": metrics["accuracy"],
+        "balanced_accuracy": metrics["balanced_accuracy"],
+        "macro_precision": metrics["macro_precision"],
+        "macro_recall": metrics["macro_recall"],
+        "macro_f1": metrics["macro_f1"],
+        "weighted_precision": metrics["weighted_precision"],
+        "weighted_recall": metrics["weighted_recall"],
+        "weighted_f1": metrics["weighted_f1"],
+        "fatigue_precision": metrics["fatigue_precision"],
+        "fatigue_recall": metrics["fatigue_recall"],
+        "fatigue_f1": metrics["fatigue_f1"],
+        "alert_precision": metrics["alert_precision"],
+        "alert_recall": metrics["alert_recall"],
+        "alert_f1": metrics["alert_f1"],
+        "sensitivity": metrics["sensitivity"],
+        "specificity": metrics["specificity"],
+        "miss_rate": metrics["miss_rate"],
+        "roc_auc": metrics["roc_auc"],
+        "auprc": metrics["auprc"],
+        "tn": metrics["tn"],
+        "fp": metrics["fp"],
+        "fn": metrics["fn"],
+        "tp": metrics["tp"],
+        "majority_class": metrics["majority_class"],
+        "majority_accuracy": metrics["majority_accuracy"],
         "confusion_matrix": metrics["confusion_matrix"].tolist(),
     }
     upsert_summary_row(path, row)
+    write_overall_metrics(path, args.label_mode)
 
 
 def write_failed_summary_row(path: Path, args: argparse.Namespace, plan: FoldPlan, exc: Exception) -> None:
@@ -909,6 +991,54 @@ def write_checkpoint_manifest_row(
     else:
         manifest = new_row
     manifest.to_csv(path, index=False)
+
+
+def write_overall_metrics(summary_path: Path, label_mode: str) -> None:
+    if not summary_path.exists():
+        return
+    summary = pd.read_csv(summary_path)
+    if "status" in summary.columns:
+        summary = summary[summary["status"] == "success"]
+    if summary.empty:
+        return
+
+    metric_names = [
+        "accuracy",
+        "balanced_accuracy",
+        "macro_f1",
+        "fatigue_recall",
+        "sensitivity",
+        "alert_recall",
+        "specificity",
+        "miss_rate",
+        "roc_auc",
+        "auprc",
+    ]
+    rows = []
+    lines = [
+        f"EEGNet source-only overall metrics ({label_mode})",
+        "Primary aggregation: subject-wise mean +/- std across completed LOSO folds.",
+        f"completed_folds={len(summary)}",
+        "",
+    ]
+    for metric_name in metric_names:
+        if metric_name not in summary.columns:
+            continue
+        values = pd.to_numeric(summary[metric_name], errors="coerce").to_numpy(dtype=float)
+        valid = values[~np.isnan(values)]
+        if len(valid) == 0:
+            mean = np.nan
+            std = np.nan
+        else:
+            mean = float(np.mean(valid))
+            std = float(np.std(valid, ddof=1)) if len(valid) > 1 else 0.0
+        rows.append({"metric": metric_name, "mean": mean, "std": std, "n": int(len(valid))})
+        lines.append(f"{metric_name}: mean={mean:.6f} std={std:.6f} n={len(valid)}")
+
+    txt_path = summary_path.parent / f"eegnet_source_only_{label_mode}_overall_metrics.txt"
+    csv_path = summary_path.parent / f"eegnet_source_only_{label_mode}_overall_metrics.csv"
+    txt_path.write_text("\n".join(lines) + "\n")
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
 
 
 def base_summary_fields(args: argparse.Namespace, plan: FoldPlan) -> dict[str, object]:
@@ -1034,6 +1164,7 @@ def print_fold_plan(plan: FoldPlan, *, dry_run: bool) -> None:
         print(f"  latest_checkpoint={plan.latest_checkpoint_path}")
     print(f"  summary={plan.summary_path}")
     print(f"  fold_report={plan.fold_report_path}")
+    print(f"  val_metrics={plan.val_metrics_path}")
     print(f"  manifest={plan.manifest_path}")
     print(f"  run_id={plan.run_id}")
     print(f"  single_fold_command={plan.single_fold_command}")
@@ -1105,8 +1236,21 @@ def print_nan_inf_after_preprocessing(*named_arrays) -> None:
 
 def print_final_metrics(metrics: dict[str, object]) -> None:
     print("target_metrics")
-    for key in ("accuracy", "balanced_accuracy", "macro_f1", "precision", "recall"):
-        print(f"  {key}: {metrics[key]:.4f}")
+    for key in (
+        "accuracy",
+        "balanced_accuracy",
+        "macro_f1",
+        "fatigue_precision",
+        "fatigue_recall",
+        "sensitivity",
+        "alert_recall",
+        "specificity",
+        "miss_rate",
+        "roc_auc",
+        "auprc",
+    ):
+        value = float(metrics[key])
+        print(f"  {key}: {value:.4f}" if not np.isnan(value) else f"  {key}: nan")
     print("confusion_matrix")
     print(metrics["confusion_matrix"])
 

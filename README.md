@@ -158,6 +158,23 @@ Inspect a checkpoint:
 python scripts/inspect_checkpoint.py --checkpoint path/to/model.pt
 ```
 
+## Metrics
+
+For binary fatigue detection, class `0` is alert and class `1` is fatigue/drowsy. Fatigue is always treated as the positive class.
+
+Reported metrics include accuracy, balanced accuracy, macro precision, macro recall, macro F1, weighted F1, fatigue precision, fatigue recall, fatigue F1, alert precision, alert recall, alert F1, ROC-AUC, AUPRC, and the stable confusion matrix values `tn`, `fp`, `fn`, `tp`.
+
+Terminology:
+
+- `sensitivity` is fatigue recall: `TP / (TP + FN)`.
+- `specificity` is alert recall: `TN / (TN + FP)`.
+- `miss_rate` is `1 - sensitivity`.
+- `majority_accuracy` is the accuracy of always predicting the majority class in that target subject.
+
+Accuracy is reported for comparison with prior fatigue-detection studies. For SEED-VIG `threshold35`, class distributions can be strongly imbalanced, so balanced accuracy and macro F1 are the primary metrics for comparing source-only LOSO performance.
+
+Overall LOSO metrics are aggregated as subject-wise mean and standard deviation across completed target-subject folds, not pooled sample-level accuracy.
+
 ## Leakage-Prevention Rules
 
 - Target labels are never used during training, validation, normalization, clipping, class weighting, early stopping, threshold selection, or model selection.
