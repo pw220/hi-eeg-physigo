@@ -58,6 +58,7 @@ class FoldPlan:
     summary_path: Path
     fold_report_path: Path
     val_metrics_path: Path
+    test_metrics_path: Path
     manifest_path: Path
     run_id: str
     created_at: str
@@ -104,6 +105,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-policy", choices=("best_val", "last", "fixed_epoch"), default="best_val")
     parser.add_argument("--fixed-eval-epoch", type=int, default=None)
     parser.add_argument("--disable-early-stop", action="store_true")
+    parser.add_argument(
+        "--test-every-epochs",
+        type=int,
+        default=0,
+        help="Diagnostic target-test evaluation interval. 0 means evaluate target only once at the end.",
+    )
     parser.add_argument("--bandpass", action="store_true")
     parser.add_argument("--robust-clip", action="store_true")
     parser.add_argument("--eegnet-f1", type=int, default=8)
@@ -257,6 +264,8 @@ def validate_training_args(args: argparse.Namespace) -> None:
             raise ValueError("--fixed-eval-epoch must be between 1 and --epochs")
     if args.validation_mode == "none" and args.early_stop_patience > 0 and not args.disable_early_stop:
         print("warning: validation-mode=none disables early stopping because no validation metrics are computed")
+    if args.test_every_epochs < 0:
+        raise ValueError("--test-every-epochs must be non-negative; use 0 for final-only target evaluation")
     if args.eegnet_f1 <= 0 or args.eegnet_d <= 0:
         raise ValueError("--eegnet-f1 and --eegnet-d must be positive")
     if args.eegnet_f2 < 0:
@@ -351,6 +360,7 @@ def plan_loso_fold(
     summary_path = outputs_dir / f"eegnet_source_only_{args.label_mode}_summary.csv"
     fold_report_path = outputs_dir / f"loso_fold_integrity_{args.label_mode}_subject_{target_subject}.txt"
     val_metrics_path = outputs_dir / f"val_metrics_{args.label_mode}_subject_{target_subject}.csv"
+    test_metrics_path = outputs_dir / f"test_metrics_history_{args.label_mode}_subject_{target_subject}.csv"
     manifest_path = outputs_dir / "checkpoints_manifest.csv"
     command = (
         "python train_eegnet_source.py "
@@ -372,6 +382,7 @@ def plan_loso_fold(
         f"--val-ratio {args.val_ratio} "
         f"--val-subject-ratio {args.val_subject_ratio} "
         f"--checkpoint-policy {args.checkpoint_policy} "
+        f"--test-every-epochs {args.test_every_epochs} "
         f"--device {args.device} "
         f"--label-mode {args.label_mode} "
         f"--class-balance {args.class_balance} "
@@ -417,6 +428,7 @@ def plan_loso_fold(
         summary_path=summary_path,
         fold_report_path=fold_report_path,
         val_metrics_path=val_metrics_path,
+        test_metrics_path=test_metrics_path,
         manifest_path=manifest_path,
         run_id=run_id,
         created_at=created_at,
@@ -532,6 +544,12 @@ def run_loso_fold(
         num_workers=args.num_workers,
         seed=args.seed,
     )
+    test_metrics_history = []
+    if args.test_every_epochs > 0:
+        print(
+            "target_interval_evaluation=diagnostic_only "
+            "target labels are not used for training, checkpoint selection, early stopping, or model selection"
+        )
 
     class_weights = compute_class_weights(train["y"], args.class_balance)
     print_class_balance(train["y"], args.class_balance, class_weights)
@@ -623,6 +641,10 @@ def run_loso_fold(
                 f"lr={current_lr:.6g} "
                 f"no_improve={epochs_without_improvement}"
             )
+        if args.test_every_epochs > 0 and epoch % args.test_every_epochs == 0:
+            epoch_metrics = evaluate_current_model_on_target(model, test_loader, device)
+            test_metrics_history.append(metrics_history_row(epoch, epoch_metrics, reason="interval_diagnostic"))
+            print_epoch_test_metrics(plan.target_subject, epoch, epoch_metrics)
         if early_stop_enabled(args) and epochs_without_improvement >= args.early_stop_patience:
             print(
                 f"early_stopping_triggered epoch={epoch} "
@@ -659,6 +681,9 @@ def run_loso_fold(
     test_metrics = classification_metrics(test_y, test_pred, test_probs[:, 1])
     print_final_metrics(test_metrics)
     has_validation = val_loader is not None
+    if test_metrics_history:
+        test_metrics_history.append(metrics_history_row(selected_epoch, test_metrics, reason="final_selected_checkpoint"))
+        save_test_metrics_history(plan.test_metrics_path, test_metrics_history)
 
     save_predictions(plan.prediction_path, test, test_y, test_pred, test_probs)
     checkpoint = {
@@ -687,6 +712,8 @@ def run_loso_fold(
         "val_ratio": args.val_ratio,
         "val_subject_ratio": args.val_subject_ratio,
         "checkpoint_policy": args.checkpoint_policy,
+        "test_every_epochs": args.test_every_epochs,
+        "test_metrics_history_path": str(plan.test_metrics_path) if test_metrics_history else "",
         "early_stop_enabled": early_stop_enabled(args),
         "best_val_metric": {
             "macro_f1": None if not has_validation else best_macro_f1,
@@ -729,6 +756,8 @@ def run_loso_fold(
     print(f"Saved summary: {plan.summary_path}")
     if val is not None:
         print(f"Saved validation metrics: {plan.val_metrics_path}")
+    if test_metrics_history:
+        print(f"Saved target diagnostic metrics: {plan.test_metrics_path}")
 
 
 def choose_device(requested: str) -> torch.device:
@@ -938,6 +967,7 @@ def training_config(args: argparse.Namespace) -> dict[str, object]:
         "val_subject_ratio": args.val_subject_ratio,
         "checkpoint_policy": args.checkpoint_policy,
         "fixed_eval_epoch": args.fixed_eval_epoch,
+        "test_every_epochs": args.test_every_epochs,
         "min_delta": args.min_delta,
         "monitor_metric": args.monitor_metric,
     }
@@ -1062,6 +1092,39 @@ def predict_logits(model, loader, device: torch.device) -> tuple[np.ndarray, np.
         logits_list.append(logits.detach().cpu().numpy())
         y_list.append(y.numpy())
     return np.concatenate(logits_list, axis=0), np.concatenate(y_list, axis=0)
+
+
+def evaluate_current_model_on_target(model, loader, device: torch.device) -> dict[str, object]:
+    logits, y_true = predict_logits(model, loader, device)
+    probs = softmax(logits)
+    y_pred = probs.argmax(axis=1)
+    return classification_metrics(y_true, y_pred, probs[:, 1])
+
+
+def metrics_history_row(epoch: int, metrics: dict[str, object], *, reason: str) -> dict[str, object]:
+    return {
+        "epoch": epoch,
+        "reason": reason,
+        "accuracy": metrics["accuracy"],
+        "balanced_accuracy": metrics["balanced_accuracy"],
+        "macro_f1": metrics["macro_f1"],
+        "fatigue_recall": metrics["fatigue_recall"],
+        "sensitivity": metrics["sensitivity"],
+        "alert_recall": metrics["alert_recall"],
+        "specificity": metrics["specificity"],
+        "miss_rate": metrics["miss_rate"],
+        "roc_auc": metrics["roc_auc"],
+        "auprc": metrics["auprc"],
+        "tn": metrics["tn"],
+        "fp": metrics["fp"],
+        "fn": metrics["fn"],
+        "tp": metrics["tp"],
+    }
+
+
+def save_test_metrics_history(path: Path, rows: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(path, index=False)
 
 
 def _monitor_value(metrics: dict[str, object], metric_name: str) -> float:
@@ -1278,6 +1341,7 @@ def write_checkpoint_manifest_row(
         "fixed_eval_epoch": args.fixed_eval_epoch,
         "disable_early_stop": args.disable_early_stop,
         "early_stop_enabled": early_stop_enabled(args),
+        "test_every_epochs": args.test_every_epochs,
         "best_epoch": best_epoch,
         "best_val_metric": best_val_metric,
         "monitor_metric": args.monitor_metric,
@@ -1403,6 +1467,7 @@ def base_summary_fields(args: argparse.Namespace, plan: FoldPlan) -> dict[str, o
         "fixed_eval_epoch": args.fixed_eval_epoch,
         "disable_early_stop": args.disable_early_stop,
         "early_stop_enabled": early_stop_enabled(args),
+        "test_every_epochs": args.test_every_epochs,
         "min_delta": args.min_delta,
         "monitor_metric": args.monitor_metric,
         "eegnet_f1": args.eegnet_f1,
@@ -1476,6 +1541,7 @@ def print_global_plan_header(args: argparse.Namespace, report: IntegrityReport, 
     print(f"  val_ratio={args.val_ratio}")
     print(f"  checkpoint_policy={args.checkpoint_policy}")
     print(f"  fixed_eval_epoch={args.fixed_eval_epoch}")
+    print(f"  test_every_epochs={args.test_every_epochs}")
     print(f"  early_stop_enabled={early_stop_enabled(args)}")
     print(
         "  eegnet="
@@ -1520,6 +1586,7 @@ def print_fold_plan(plan: FoldPlan, *, dry_run: bool) -> None:
     print(f"  summary={plan.summary_path}")
     print(f"  fold_report={plan.fold_report_path}")
     print(f"  val_metrics={plan.val_metrics_path}")
+    print(f"  test_metrics_history={plan.test_metrics_path}")
     print(f"  manifest={plan.manifest_path}")
     print(f"  run_id={plan.run_id}")
     print(f"  single_fold_command={plan.single_fold_command}")
@@ -1613,6 +1680,18 @@ def print_final_metrics(metrics: dict[str, object]) -> None:
         print(f"  {key}: {value:.4f}" if not np.isnan(value) else f"  {key}: nan")
     print("confusion_matrix")
     print(metrics["confusion_matrix"])
+
+
+def print_epoch_test_metrics(target_subject: int, epoch: int, metrics: dict[str, object]) -> None:
+    print(
+        f"target_diagnostic_metrics target_subject={target_subject} epoch={epoch:03d} "
+        f"accuracy={float(metrics['accuracy']):.4f} "
+        f"balanced_accuracy={float(metrics['balanced_accuracy']):.4f} "
+        f"macro_f1={float(metrics['macro_f1']):.4f} "
+        f"sensitivity={float(metrics['sensitivity']):.4f} "
+        f"specificity={float(metrics['specificity']):.4f} "
+        f"miss_rate={float(metrics['miss_rate']):.4f}"
+    )
 
 
 def pair_subjects(pairs: list[tuple[Path, Path]]) -> list[int]:
