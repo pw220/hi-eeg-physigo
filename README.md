@@ -41,6 +41,12 @@ Colab / Google Drive example:
 /content/drive/MyDrive/SEED-VIG/perclos_labels
 ```
 
+SADT is a processed `.mat` file and should also stay out of Git. The default local path is:
+
+```text
+data/sad-data.mat
+```
+
 ## Label Modes
 
 - `threshold35` default: PERCLOS `<= 0.35` is alert class `0`; PERCLOS `> 0.35` is fatigue class `1`; no intermediate samples are discarded.
@@ -58,6 +64,54 @@ One-fold CPU smoke test:
 
 ```bash
 python train_eegnet_source.py --target-subject 1 --epochs 1 --batch-size 64 --device cpu --label-mode threshold35 --class-balance weighted_loss
+```
+
+## Running Different Datasets And Models
+
+For now, `eegnet` is the only supported model. Dataset selection is controlled by `--dataset`.
+
+SEED-VIG example:
+
+```bash
+python train_eegnet_source.py \
+  --dataset seedvig \
+  --model eegnet \
+  --target-subject 1 \
+  --epochs 2 \
+  --batch-size 64 \
+  --device cpu \
+  --label-mode threshold35 \
+  --class-balance weighted_loss
+```
+
+SADT example:
+
+```bash
+python train_eegnet_source.py \
+  --dataset sadt \
+  --model eegnet \
+  --sadt-path data/sad-data.mat \
+  --target-subject 1 \
+  --epochs 2 \
+  --batch-size 64 \
+  --device cpu \
+  --validation-mode sample_stratified \
+  --class-balance weighted_loss
+```
+
+SADT full LOSO GPU example:
+
+```bash
+python train_eegnet_source.py \
+  --dataset sadt \
+  --model eegnet \
+  --sadt-path data/sad-data.mat \
+  --run-all-loso \
+  --epochs 50 \
+  --batch-size 64 \
+  --device cuda \
+  --validation-mode sample_stratified \
+  --class-balance weighted_loss
 ```
 
 Configurable one-fold training example. The backbone remains the faithful ARL EEGNet-8,2 port; pooling is fixed at `(1, 4)` then `(1, 8)` to match the original architecture.

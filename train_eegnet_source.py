@@ -35,13 +35,20 @@ from data.seedvig_dataset import (
     parse_subject_id,
     sessions_to_arrays,
 )
-from models.eegnet import EEGNet
+from data.sadt_dataset import load_sadt_arrays, sadt_counts
+from models.factory import build_model
 from utils.metrics import classification_metrics, entropy_from_probs, softmax
 from utils.seed import set_seed
 
 
 @dataclass(frozen=True)
 class FoldPlan:
+    dataset: str
+    model_name: str
+    label_protocol: str
+    input_channels: int
+    input_samples: int
+    num_classes: int
     target_subject: int
     train_pairs: list[tuple[Path, Path]]
     val_pairs: list[tuple[Path, Path]]
@@ -69,11 +76,28 @@ class FoldPlan:
     validation_strategy: str
 
 
+@dataclass(frozen=True)
+class DatasetContext:
+    dataset: str
+    model_name: str
+    label_protocol: str
+    input_channels: int
+    input_samples: int
+    num_classes: int
+    subjects: list[int]
+    integrity_report: IntegrityReport | None
+    file_pairs: list[tuple[Path, Path]]
+    sadt_arrays: dict[str, np.ndarray] | None
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Source-only EEGNet LOSO baseline on SEED-VIG raw EEG")
+    parser = argparse.ArgumentParser(description="Source-only EEGNet LOSO baseline on EEG fatigue datasets")
+    parser.add_argument("--dataset", choices=("seedvig", "sadt"), default="seedvig")
+    parser.add_argument("--model", choices=("eegnet",), default="eegnet")
     parser.add_argument("--data-root", default="data/raw/SEED-VIG")
     parser.add_argument("--raw-data-dir", default=None)
     parser.add_argument("--label-dir", default=None)
+    parser.add_argument("--sadt-path", default="data/sad-data.mat")
     parser.add_argument("--target-subject", type=int, default=1)
     parser.add_argument("--run-all-loso", action="store_true")
     parser.add_argument("--max-folds", type=int, default=None)
@@ -147,33 +171,14 @@ def main() -> None:
     outputs_dir = Path(args.output_dir)
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Full integrity reports are saved for both label modes. Fold planning uses
-    # only the selected mode report.
-    reports = {}
-    for label_mode in ("threshold35", "strict035070"):
-        report = build_seedvig_integrity_report(
-            args.data_root,
-            raw_data_dir=args.raw_data_dir,
-            label_dir=args.label_dir,
-            label_mode=label_mode,
-            min_class_samples=args.min_class_samples,
-            metadata_only=args.dry_run,
-        )
-        reports[label_mode] = report
-        if not args.dry_run:
-            save_integrity_csv(report, outputs_dir / f"seedvig_integrity_{label_mode}.csv")
+    context = build_dataset_context(args, outputs_dir)
+    target_subjects = resolve_target_subjects(args, context.subjects)
 
-    integrity_report = reports[args.label_mode]
-    file_pairs = integrity_report.valid_file_pairs
-    subjects = sorted({parse_subject_id(raw_path) for raw_path, _ in file_pairs})
-    target_subjects = resolve_target_subjects(args, subjects)
-
-    print_global_plan_header(args, integrity_report, target_subjects)
+    print_global_plan_header(args, context, target_subjects)
     plans = [
         plan_loso_fold(
             args=args,
-            integrity_report=integrity_report,
-            file_pairs=file_pairs,
+            context=context,
             target_subject=target_subject,
             outputs_dir=outputs_dir,
         )
@@ -183,7 +188,7 @@ def main() -> None:
     if args.dry_run:
         for plan in plans:
             print_fold_plan(plan, dry_run=True)
-        print_recommended_gpu_command()
+        print_recommended_gpu_command(args)
         return
 
     device = choose_device(args.device)
@@ -194,7 +199,7 @@ def main() -> None:
             print(f"Skipping target_subject={plan.target_subject}: existing prediction CSV and checkpoint found")
             continue
         try:
-            run_loso_fold(args, integrity_report, plan, device, repro_metadata)
+            run_loso_fold(args, context, plan, device, repro_metadata)
         except Exception as exc:  # noqa: BLE001 - all-LOSO should continue after fold failures
             print(f"Fold target_subject={plan.target_subject} failed: {exc}")
             traceback.print_exc()
@@ -214,7 +219,7 @@ def main() -> None:
             if not args.run_all_loso:
                 raise
 
-    print_recommended_gpu_command()
+    print_recommended_gpu_command(args)
 
 
 def resolve_target_subjects(args: argparse.Namespace, subjects: list[int]) -> list[int]:
@@ -228,6 +233,60 @@ def resolve_target_subjects(args: argparse.Namespace, subjects: list[int]) -> li
     if args.target_subject not in subjects:
         raise ValueError(f"Target subject {args.target_subject} not found. Available: {subjects}")
     return [args.target_subject]
+
+
+def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> DatasetContext:
+    if args.dataset == "seedvig":
+        reports = {}
+        for label_mode in ("threshold35", "strict035070"):
+            report = build_seedvig_integrity_report(
+                args.data_root,
+                raw_data_dir=args.raw_data_dir,
+                label_dir=args.label_dir,
+                label_mode=label_mode,
+                min_class_samples=args.min_class_samples,
+                metadata_only=args.dry_run,
+            )
+            reports[label_mode] = report
+            if not args.dry_run:
+                save_integrity_csv(report, outputs_dir / f"seedvig_integrity_{label_mode}.csv")
+        report = reports[args.label_mode]
+        file_pairs = report.valid_file_pairs
+        subjects = sorted({parse_subject_id(raw_path) for raw_path, _ in file_pairs})
+        return DatasetContext(
+            dataset="seedvig",
+            model_name=args.model,
+            label_protocol=args.label_mode,
+            input_channels=17,
+            input_samples=1600,
+            num_classes=2,
+            subjects=subjects,
+            integrity_report=report,
+            file_pairs=file_pairs,
+            sadt_arrays=None,
+        )
+    if args.dataset == "sadt":
+        arrays = load_sadt_arrays(args.sadt_path)
+        subjects = sorted({int(subject) for subject in arrays["subject_id"]})
+        print("sadt_dataset_summary")
+        print(f"  path={args.sadt_path}")
+        print(f"  samples={len(arrays['y'])}")
+        print(f"  subjects={subjects}")
+        print("  label_protocol=rt_binary")
+        print("  label_mode_not_applicable=True")
+        return DatasetContext(
+            dataset="sadt",
+            model_name=args.model,
+            label_protocol="rt_binary",
+            input_channels=30,
+            input_samples=384,
+            num_classes=2,
+            subjects=subjects,
+            integrity_report=None,
+            file_pairs=[],
+            sadt_arrays=arrays,
+        )
+    raise ValueError(f"Unsupported dataset: {args.dataset}")
 
 
 def validate_training_args(args: argparse.Namespace) -> None:
@@ -266,6 +325,8 @@ def validate_training_args(args: argparse.Namespace) -> None:
         print("warning: validation-mode=none disables early stopping because no validation metrics are computed")
     if args.test_every_epochs < 0:
         raise ValueError("--test-every-epochs must be non-negative; use 0 for final-only target evaluation")
+    if args.dataset == "sadt" and args.bandpass:
+        raise ValueError("--bandpass is not supported for SADT because SADT is already preprocessed")
     if args.eegnet_f1 <= 0 or args.eegnet_d <= 0:
         raise ValueError("--eegnet-f1 and --eegnet-d must be positive")
     if args.eegnet_f2 < 0:
@@ -292,22 +353,14 @@ def fold_outputs_exist(plan: FoldPlan) -> bool:
 
 
 def existing_checkpoints_for_plan(plan: FoldPlan) -> list[Path]:
-    pattern = (
-        f"eegnet_source_only_*_subject_{plan.target_subject}_seed*.pt"
-        if not plan.checkpoint_path.parent.exists()
-        else f"eegnet_source_only_*_subject_{plan.target_subject}_seed*.pt"
-    )
+    pattern = f"{plan.dataset}_{plan.model_name}_source_only_*_subject_{plan.target_subject}_seed*.pt"
     return sorted(plan.checkpoint_path.parent.glob(pattern))
 
 
-def plan_loso_fold(
-    *,
-    args: argparse.Namespace,
-    integrity_report: IntegrityReport,
-    file_pairs: list[tuple[Path, Path]],
-    target_subject: int,
-    outputs_dir: Path,
-) -> FoldPlan:
+def plan_seedvig_splits(args: argparse.Namespace, context: DatasetContext, target_subject: int):
+    if context.integrity_report is None:
+        raise ValueError("SEED-VIG planning requires an integrity report")
+    file_pairs = context.file_pairs
     source_pairs = [(raw, label) for raw, label in file_pairs if parse_subject_id(raw) != target_subject]
     test_pairs = [(raw, label) for raw, label in file_pairs if parse_subject_id(raw) == target_subject]
     if args.validation_mode == "subject_split":
@@ -317,53 +370,117 @@ def plan_loso_fold(
             val_subject_ratio=args.val_subject_ratio,
             seed=args.seed,
         )
-        train_counts = counts_for_pairs(train_pairs, integrity_report)
-        val_counts = counts_for_pairs(val_pairs, integrity_report)
+        train_counts = counts_for_pairs(train_pairs, context.integrity_report)
+        val_counts = counts_for_pairs(val_pairs, context.integrity_report)
         train_subject_ids = pair_subjects(train_pairs)
         val_subject_ids = pair_subjects(val_pairs)
-        validation_strategy = "deterministic source-subject split controlled by seed and val_subject_ratio"
     elif args.validation_mode == "sample_stratified":
         if not source_pairs or not test_pairs:
             raise ValueError("Invalid LOSO split produced an empty source or test partition")
         train_pairs = source_pairs
         val_pairs = []
-        source_counts = counts_for_pairs(source_pairs, integrity_report)
+        source_counts = counts_for_pairs(source_pairs, context.integrity_report)
         train_counts, val_counts = stratified_metadata_counts(source_counts, args.val_ratio)
         train_subject_ids = pair_subjects(source_pairs)
         val_subject_ids = pair_subjects(source_pairs)
-        validation_strategy = "sample-level stratified validation within source subjects controlled by seed and val_ratio"
     elif args.validation_mode == "none":
         if not source_pairs or not test_pairs:
             raise ValueError("Invalid LOSO split produced an empty source or test partition")
         train_pairs = source_pairs
         val_pairs = []
-        train_counts = counts_for_pairs(source_pairs, integrity_report)
+        train_counts = counts_for_pairs(source_pairs, context.integrity_report)
         val_counts = zero_counts()
         train_subject_ids = pair_subjects(source_pairs)
         val_subject_ids = []
-        validation_strategy = "no validation set; all non-target source samples used for training"
     else:
         raise ValueError(f"Unsupported validation mode: {args.validation_mode}")
-    test_counts = counts_for_pairs(test_pairs, integrity_report)
+    test_counts = counts_for_pairs(test_pairs, context.integrity_report)
+    return train_pairs, val_pairs, test_pairs, train_counts, val_counts, test_counts, train_subject_ids, val_subject_ids
+
+
+def plan_array_splits(args: argparse.Namespace, context: DatasetContext, target_subject: int):
+    if context.sadt_arrays is None:
+        raise ValueError("Array dataset planning requires loaded arrays")
+    arrays = context.sadt_arrays
+    source = subset_by_subject(arrays, target_subject, include=False)
+    test = subset_by_subject(arrays, target_subject, include=True)
+    if len(test["y"]) == 0:
+        raise ValueError(f"Target subject {target_subject} has no samples")
+    source_subjects = sorted({int(subject) for subject in source["subject_id"]})
+    if args.validation_mode == "subject_split":
+        train_subject_ids, val_subject_ids = split_subject_ids(source_subjects, args.val_subject_ratio, args.seed)
+        train = subset_by_subject_ids(source, train_subject_ids)
+        val = subset_by_subject_ids(source, val_subject_ids)
+        train_counts = sadt_counts(train)
+        val_counts = sadt_counts(val)
+    elif args.validation_mode == "sample_stratified":
+        train, val = split_arrays_stratified(source, val_ratio=args.val_ratio, seed=args.seed)
+        train_subject_ids = source_subjects
+        val_subject_ids = source_subjects
+        train_counts = sadt_counts(train)
+        val_counts = sadt_counts(val)
+    elif args.validation_mode == "none":
+        train_subject_ids = source_subjects
+        val_subject_ids = []
+        train_counts = sadt_counts(source)
+        val_counts = zero_counts()
+    else:
+        raise ValueError(f"Unsupported validation mode: {args.validation_mode}")
+    return train_counts, val_counts, sadt_counts(test), train_subject_ids, val_subject_ids
+
+
+def validation_strategy_text(validation_mode: str) -> str:
+    if validation_mode == "subject_split":
+        return "deterministic source-subject split controlled by seed and val_subject_ratio"
+    if validation_mode == "sample_stratified":
+        return "sample-level stratified validation within source subjects controlled by seed and val_ratio"
+    if validation_mode == "none":
+        return "no validation set; all non-target source samples used for training"
+    raise ValueError(f"Unsupported validation mode: {validation_mode}")
+
+
+def plan_loso_fold(
+    *,
+    args: argparse.Namespace,
+    context: DatasetContext,
+    target_subject: int,
+    outputs_dir: Path,
+) -> FoldPlan:
+    if context.dataset == "seedvig":
+        train_pairs, val_pairs, test_pairs, train_counts, val_counts, test_counts, train_subject_ids, val_subject_ids = (
+            plan_seedvig_splits(args, context, target_subject)
+        )
+    else:
+        train_pairs, val_pairs, test_pairs = [], [], []
+        train_counts, val_counts, test_counts, train_subject_ids, val_subject_ids = plan_array_splits(
+            args,
+            context,
+            target_subject,
+        )
+    validation_strategy = validation_strategy_text(args.validation_mode)
     created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     run_id = make_run_id(args, target_subject)
     checkpoints_dir = outputs_dir / "checkpoints"
-    prediction_path = outputs_dir / f"eegnet_source_only_{args.label_mode}_subject_{target_subject}.csv"
+    output_stem = f"{context.dataset}_{context.model_name}_source_only_{context.label_protocol}_subject_{target_subject}"
+    summary_stem = f"{context.dataset}_{context.model_name}_source_only_{context.label_protocol}"
+    prediction_path = outputs_dir / f"{output_stem}.csv"
     checkpoint_path = checkpoints_dir / (
-        f"eegnet_source_only_{args.label_mode}_subject_{target_subject}_seed{args.seed}_{run_id}.pt"
+        f"{output_stem}_seed{args.seed}_{run_id}.pt"
     )
     latest_checkpoint_path = (
-        checkpoints_dir / f"eegnet_source_only_{args.label_mode}_subject_{target_subject}_seed{args.seed}_latest.pt"
+        checkpoints_dir / f"{output_stem}_seed{args.seed}_latest.pt"
         if args.save_latest
         else None
     )
-    summary_path = outputs_dir / f"eegnet_source_only_{args.label_mode}_summary.csv"
-    fold_report_path = outputs_dir / f"loso_fold_integrity_{args.label_mode}_subject_{target_subject}.txt"
-    val_metrics_path = outputs_dir / f"val_metrics_{args.label_mode}_subject_{target_subject}.csv"
-    test_metrics_path = outputs_dir / f"test_metrics_history_{args.label_mode}_subject_{target_subject}.csv"
+    summary_path = outputs_dir / f"{summary_stem}_summary.csv"
+    fold_report_path = outputs_dir / f"loso_fold_integrity_{summary_stem}_subject_{target_subject}.txt"
+    val_metrics_path = outputs_dir / f"val_metrics_{summary_stem}_subject_{target_subject}.csv"
+    test_metrics_path = outputs_dir / f"test_metrics_history_{summary_stem}_subject_{target_subject}.csv"
     manifest_path = outputs_dir / "checkpoints_manifest.csv"
     command = (
         "python train_eegnet_source.py "
+        f"--dataset {args.dataset} "
+        f"--model {args.model} "
         f"--target-subject {target_subject} "
         f"--epochs {args.epochs} "
         f"--batch-size {args.batch_size} "
@@ -400,6 +517,8 @@ def plan_loso_fold(
     if args.raw_data_dir is not None and args.label_dir is not None:
         command += f" --raw-data-dir {shlex.quote(str(args.raw_data_dir))}"
         command += f" --label-dir {shlex.quote(str(args.label_dir))}"
+    if args.dataset == "sadt":
+        command += f" --sadt-path {shlex.quote(str(args.sadt_path))}"
     if args.bandpass:
         command += " --bandpass"
     if args.robust_clip:
@@ -412,13 +531,19 @@ def plan_loso_fold(
         command += " --deterministic"
 
     return FoldPlan(
+        dataset=context.dataset,
+        model_name=context.model_name,
+        label_protocol=context.label_protocol,
+        input_channels=context.input_channels,
+        input_samples=context.input_samples,
+        num_classes=context.num_classes,
         target_subject=target_subject,
         train_pairs=train_pairs,
         val_pairs=val_pairs,
         test_pairs=test_pairs,
         train_subject_ids=train_subject_ids,
         val_subject_ids=val_subject_ids,
-        test_subject_ids=pair_subjects(test_pairs),
+        test_subject_ids=[target_subject],
         train_counts=train_counts,
         val_counts=val_counts,
         test_counts=test_counts,
@@ -442,63 +567,23 @@ def plan_loso_fold(
 
 def run_loso_fold(
     args: argparse.Namespace,
-    integrity_report: IntegrityReport,
+    context: DatasetContext,
     plan: FoldPlan,
     device: torch.device,
     repro_metadata: dict[str, object],
 ) -> None:
     set_seed(args.seed, deterministic=args.deterministic)
     guard_run_outputs(args, plan)
-    write_loso_fold_integrity_report(
-        integrity_report,
-        plan.fold_report_path,
-        target_subject=plan.target_subject,
-        train_pairs=plan.train_pairs,
-        val_pairs=plan.val_pairs,
-        test_pairs=plan.test_pairs,
-        robust_clip=args.robust_clip,
-        validation_mode=args.validation_mode,
-        validation_strategy=plan.validation_strategy,
-        val_ratio=args.val_ratio,
-        val_subject_ratio=args.val_subject_ratio,
-        checkpoint_policy=args.checkpoint_policy,
-        early_stop_enabled=early_stop_enabled(args),
-        train_counts=plan.train_counts,
-        val_counts=plan.val_counts,
-        test_counts=plan.test_counts,
-    )
-    print_integrity_report_summary(
-        integrity_report,
-        target_subject=plan.target_subject,
-        train_pairs=plan.train_pairs,
-        val_pairs=plan.val_pairs,
-        test_pairs=plan.test_pairs,
-        train_counts=plan.train_counts,
-        val_counts=plan.val_counts,
-        test_counts=plan.test_counts,
-    )
+    write_fold_report(args, context, plan)
+    print_dataset_fold_summary(args, context, plan)
     print_fold_plan(plan, dry_run=False)
 
-    train_sessions = load_seedvig_file_pairs(plan.train_pairs, label_mode=args.label_mode, bandpass=args.bandpass)
-    if args.validation_mode == "subject_split":
-        val_sessions = load_seedvig_file_pairs(plan.val_pairs, label_mode=args.label_mode, bandpass=args.bandpass)
-        train = sessions_to_arrays(train_sessions)
-        val = sessions_to_arrays(val_sessions)
-    elif args.validation_mode == "sample_stratified":
-        val_sessions = []
-        source = sessions_to_arrays(train_sessions)
-        train, val = split_arrays_stratified(source, val_ratio=args.val_ratio, seed=args.seed)
-    elif args.validation_mode == "none":
-        val_sessions = []
-        train = sessions_to_arrays(train_sessions)
-        val = None
-    else:
-        raise ValueError(f"Unsupported validation mode: {args.validation_mode}")
+    train, val, test, train_sessions, val_sessions, test_sessions = load_fold_arrays(args, context, plan)
     assert plan.target_subject not in set(train["subject_id"])
     if val is not None:
         assert plan.target_subject not in set(val["subject_id"])
 
-    print_source_sanity(train_sessions, val_sessions)
+    print_source_sanity(train_sessions, val_sessions, context)
     print_source_split_sanity(train, val)
     train_x, val_x, preprocess_state = preprocess_source(
         train["x"],
@@ -514,11 +599,9 @@ def run_loso_fold(
 
     # Target labels are loaded after source-only preprocessing state is fixed;
     # they are used only for final evaluation and saved prediction diagnostics.
-    test_sessions = load_seedvig_file_pairs(plan.test_pairs, label_mode=args.label_mode, bandpass=args.bandpass)
-    test = sessions_to_arrays(test_sessions)
     assert set(test["subject_id"]) == {plan.target_subject}
     test["x"] = preprocess_target(test["x"], preprocess_state)
-    print_target_sanity(test_sessions, test)
+    print_target_sanity(test_sessions, test, context)
     print_nan_inf_after_preprocessing(("test", test))
 
     train_loader = make_loader(
@@ -555,10 +638,10 @@ def run_loso_fold(
     print_class_balance(train["y"], args.class_balance, class_weights)
     criterion_weight = None if class_weights is None else torch.tensor(class_weights, dtype=torch.float32, device=device)
 
-    model_config = eegnet_model_config(args)
+    model_config = eegnet_model_config(args, context)
     print_model_and_training_config(args, model_config)
     set_seed(args.seed, deterministic=args.deterministic)
-    model = EEGNet(**model_config).to(device)
+    model = build_model(args.model, context.input_channels, context.input_samples, context.num_classes, args).to(device)
     optimizer = make_optimizer(model, args)
     scheduler = make_scheduler(optimizer, args)
     criterion = nn.CrossEntropyLoss(weight=criterion_weight)
@@ -699,10 +782,16 @@ def run_loso_fold(
         test_metrics_history.append(metrics_history_row(selected_epoch, test_metrics, reason="final_selected_checkpoint"))
         save_test_metrics_history(plan.test_metrics_path, test_metrics_history)
 
-    save_predictions(plan.prediction_path, test, test_y, test_pred, test_probs)
+    save_predictions(plan.prediction_path, test, test_y, test_pred, test_probs, plan)
     checkpoint = {
         "run_id": plan.run_id,
         "created_at": plan.created_at,
+        "dataset": plan.dataset,
+        "model": plan.model_name,
+        "input_channels": plan.input_channels,
+        "input_samples": plan.input_samples,
+        "num_classes": plan.num_classes,
+        "label_protocol": plan.label_protocol,
         "command": plan.command,
         "reproducibility": repro_metadata,
         "model_state_dict": selected_state,
@@ -776,6 +865,126 @@ def run_loso_fold(
         print(f"Saved validation metrics: {plan.val_metrics_path}")
     if test_metrics_history:
         print(f"Saved target diagnostic metrics: {plan.test_metrics_path}")
+
+
+def write_fold_report(args: argparse.Namespace, context: DatasetContext, plan: FoldPlan) -> None:
+    if context.dataset == "seedvig":
+        if context.integrity_report is None:
+            raise ValueError("SEED-VIG fold report requires an integrity report")
+        write_loso_fold_integrity_report(
+            context.integrity_report,
+            plan.fold_report_path,
+            target_subject=plan.target_subject,
+            train_pairs=plan.train_pairs,
+            val_pairs=plan.val_pairs,
+            test_pairs=plan.test_pairs,
+            robust_clip=args.robust_clip,
+            validation_mode=args.validation_mode,
+            validation_strategy=plan.validation_strategy,
+            val_ratio=args.val_ratio,
+            val_subject_ratio=args.val_subject_ratio,
+            checkpoint_policy=args.checkpoint_policy,
+            early_stop_enabled=early_stop_enabled(args),
+            train_counts=plan.train_counts,
+            val_counts=plan.val_counts,
+            test_counts=plan.test_counts,
+        )
+        return
+    lines = [
+        "SADT LOSO Fold Integrity Report",
+        "",
+        f"Dataset: {context.dataset}",
+        f"Model: {context.model_name}",
+        f"Input channels: {context.input_channels}",
+        f"Input samples: {context.input_samples}",
+        f"Num classes: {context.num_classes}",
+        f"Label protocol: {context.label_protocol}",
+        f"Target subject ID: {plan.target_subject}",
+        f"Train subject IDs: {plan.train_subject_ids}",
+        f"Validation subject IDs: {plan.val_subject_ids}",
+        f"Test subject IDs: {plan.test_subject_ids}",
+        f"Validation mode: {args.validation_mode}",
+        f"Validation strategy: {plan.validation_strategy}",
+        f"Checkpoint policy: {args.checkpoint_policy}",
+        "",
+        f"train: samples={plan.train_counts['usable']} alert={plan.train_counts['alert']} fatigue={plan.train_counts['fatigue']}",
+        f"val: samples={plan.val_counts['usable']} alert={plan.val_counts['alert']} fatigue={plan.val_counts['fatigue']}",
+        f"test: samples={plan.test_counts['usable']} alert={plan.test_counts['alert']} fatigue={plan.test_counts['fatigue']}",
+        "",
+        "Preprocessing leakage checks:",
+        "Normalization statistics source: source-training data only",
+        f"Clipping statistics source: {'source-training data only' if args.robust_clip else 'not computed; robust clipping disabled'}",
+        "Target labels are audit/evaluation only.",
+        "No target samples were used for training, validation, preprocessing statistics, class weights, or model selection.",
+    ]
+    plan.fold_report_path.parent.mkdir(parents=True, exist_ok=True)
+    plan.fold_report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def print_dataset_fold_summary(args: argparse.Namespace, context: DatasetContext, plan: FoldPlan) -> None:
+    if context.dataset == "seedvig" and context.integrity_report is not None:
+        print_integrity_report_summary(
+            context.integrity_report,
+            target_subject=plan.target_subject,
+            train_pairs=plan.train_pairs,
+            val_pairs=plan.val_pairs,
+            test_pairs=plan.test_pairs,
+            train_counts=plan.train_counts,
+            val_counts=plan.val_counts,
+            test_counts=plan.test_counts,
+        )
+    print("dataset_fold_summary")
+    print(f"  dataset={context.dataset}")
+    print(f"  model={context.model_name}")
+    print(f"  input_channels={context.input_channels}")
+    print(f"  input_samples={context.input_samples}")
+    print(f"  num_classes={context.num_classes}")
+    print(f"  label_protocol={context.label_protocol}")
+    if context.dataset == "sadt":
+        print(f"  label_mode={args.label_mode} ignored_for_sadt=True")
+    print(f"  normalization_stats=source_training_only")
+
+
+def load_fold_arrays(
+    args: argparse.Namespace,
+    context: DatasetContext,
+    plan: FoldPlan,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray] | None, dict[str, np.ndarray], list, list, list]:
+    if context.dataset == "seedvig":
+        train_sessions = load_seedvig_file_pairs(plan.train_pairs, label_mode=args.label_mode, bandpass=args.bandpass)
+        if args.validation_mode == "subject_split":
+            val_sessions = load_seedvig_file_pairs(plan.val_pairs, label_mode=args.label_mode, bandpass=args.bandpass)
+            train = sessions_to_arrays(train_sessions)
+            val = sessions_to_arrays(val_sessions)
+        elif args.validation_mode == "sample_stratified":
+            val_sessions = []
+            source = sessions_to_arrays(train_sessions)
+            train, val = split_arrays_stratified(source, val_ratio=args.val_ratio, seed=args.seed)
+        elif args.validation_mode == "none":
+            val_sessions = []
+            train = sessions_to_arrays(train_sessions)
+            val = None
+        else:
+            raise ValueError(f"Unsupported validation mode: {args.validation_mode}")
+        test_sessions = load_seedvig_file_pairs(plan.test_pairs, label_mode=args.label_mode, bandpass=args.bandpass)
+        test = sessions_to_arrays(test_sessions)
+        return train, val, test, train_sessions, val_sessions, test_sessions
+
+    if context.sadt_arrays is None:
+        raise ValueError("SADT arrays are not loaded")
+    source = subset_by_subject(context.sadt_arrays, plan.target_subject, include=False)
+    test = subset_by_subject(context.sadt_arrays, plan.target_subject, include=True)
+    if args.validation_mode == "subject_split":
+        train = subset_by_subject_ids(source, plan.train_subject_ids)
+        val = subset_by_subject_ids(source, plan.val_subject_ids)
+    elif args.validation_mode == "sample_stratified":
+        train, val = split_arrays_stratified(source, val_ratio=args.val_ratio, seed=args.seed)
+    elif args.validation_mode == "none":
+        train = source
+        val = None
+    else:
+        raise ValueError(f"Unsupported validation mode: {args.validation_mode}")
+    return train, val, test, [], [], []
 
 
 def choose_device(requested: str) -> torch.device:
@@ -853,6 +1062,30 @@ def split_loso_file_pairs(file_pairs, *, target_subject: int, val_subject_ratio:
     return train_pairs, val_pairs, test_pairs
 
 
+def split_subject_ids(subjects: list[int], val_subject_ratio: float, seed: int) -> tuple[list[int], list[int]]:
+    rng = np.random.default_rng(seed)
+    shuffled = np.array(sorted(subjects))
+    rng.shuffle(shuffled)
+    val_count = max(1, int(round(len(subjects) * val_subject_ratio)))
+    val_subjects = sorted(int(subject) for subject in shuffled[:val_count])
+    train_subjects = sorted(int(subject) for subject in shuffled[val_count:])
+    if not train_subjects or not val_subjects:
+        raise ValueError("Subject split produced an empty train or validation partition")
+    return train_subjects, val_subjects
+
+
+def subset_by_subject(arrays: dict[str, np.ndarray], subject_id: int, *, include: bool) -> dict[str, np.ndarray]:
+    mask = arrays["subject_id"] == subject_id
+    if not include:
+        mask = ~mask
+    return index_arrays(arrays, np.flatnonzero(mask))
+
+
+def subset_by_subject_ids(arrays: dict[str, np.ndarray], subject_ids: list[int]) -> dict[str, np.ndarray]:
+    mask = np.isin(arrays["subject_id"], np.array(subject_ids, dtype=np.int64))
+    return index_arrays(arrays, np.flatnonzero(mask))
+
+
 def split_arrays_stratified(
     arrays: dict[str, np.ndarray],
     *,
@@ -888,16 +1121,16 @@ def index_arrays(arrays: dict[str, np.ndarray], indices: np.ndarray) -> dict[str
 def preprocess_source(train_x: np.ndarray, val_x: np.ndarray | None, *, robust_clip: bool):
     clip_bounds = None
     if robust_clip:
-        lo, hi = compute_robust_clip_bounds(train_x)
-        train_x = apply_robust_clip(train_x, lo, hi)
+        lo, hi = compute_clip_bounds(train_x)
+        train_x = robust_clip_array(train_x, lo, hi)
         if val_x is not None:
-            val_x = apply_robust_clip(val_x, lo, hi)
+            val_x = robust_clip_array(val_x, lo, hi)
         clip_bounds = (lo, hi)
 
-    mean, std = compute_channel_stats(train_x)
+    mean, std = compute_stats(train_x)
     state = {"clip_bounds": clip_bounds, "mean": mean, "std": std}
-    train_x = apply_channel_zscore(train_x, mean, std)
-    val_x = None if val_x is None else apply_channel_zscore(val_x, mean, std)
+    train_x = zscore_array(train_x, mean, std)
+    val_x = None if val_x is None else zscore_array(val_x, mean, std)
     return train_x, val_x, state
 
 
@@ -905,8 +1138,33 @@ def preprocess_target(test_x: np.ndarray, state: dict[str, object]) -> np.ndarra
     clip_bounds = state["clip_bounds"]
     if clip_bounds is not None:
         lo, hi = clip_bounds
-        test_x = apply_robust_clip(test_x, lo, hi)
-    return apply_channel_zscore(test_x, state["mean"], state["std"])
+        test_x = robust_clip_array(test_x, lo, hi)
+    return zscore_array(test_x, state["mean"], state["std"])
+
+
+def compute_stats(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    channels = x.shape[1]
+    mean = x.mean(axis=(0, 2), keepdims=False).astype(np.float32).reshape(channels, 1)
+    std = x.std(axis=(0, 2), keepdims=False).astype(np.float32).reshape(channels, 1)
+    std = np.where(std < 1e-6, 1.0, std).astype(np.float32)
+    return mean, std
+
+
+def zscore_array(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    channels = x.shape[1]
+    return ((x - mean.reshape(1, channels, 1)) / std.reshape(1, channels, 1)).astype(np.float32)
+
+
+def compute_clip_bounds(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    channels = x.shape[1]
+    lo = np.percentile(x, 0.5, axis=(0, 2)).astype(np.float32).reshape(channels, 1)
+    hi = np.percentile(x, 99.5, axis=(0, 2)).astype(np.float32).reshape(channels, 1)
+    return lo, hi
+
+
+def robust_clip_array(x: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
+    channels = x.shape[1]
+    return np.clip(x, lo.reshape(1, channels, 1), hi.reshape(1, channels, 1)).astype(np.float32)
 
 
 def tensorize_clip_bounds(clip_bounds):
@@ -951,11 +1209,11 @@ def make_seed_worker(seed: int):
     return seed_worker
 
 
-def eegnet_model_config(args: argparse.Namespace) -> dict[str, object]:
+def eegnet_model_config(args: argparse.Namespace, context: DatasetContext) -> dict[str, object]:
     return {
-        "channels": 17,
-        "samples": 1600,
-        "num_classes": 2,
+        "channels": context.input_channels,
+        "samples": context.input_samples,
+        "num_classes": context.num_classes,
         "F1": args.eegnet_f1,
         "D": args.eegnet_d,
         "F2": None if args.eegnet_f2 == 0 else args.eegnet_f2,
@@ -1200,12 +1458,14 @@ def save_validation_subject_metrics(
     pd.DataFrame(rows).to_csv(path, index=False)
 
 
-def save_predictions(path: Path, arrays: dict[str, np.ndarray], y_true, y_pred, probs) -> None:
+def save_predictions(path: Path, arrays: dict[str, np.ndarray], y_true, y_pred, probs, plan: FoldPlan) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     confidence = probs.max(axis=1)
     entropy = entropy_from_probs(probs)
     df = pd.DataFrame(
         {
+            "dataset": plan.dataset,
+            "model": plan.model_name,
             "sample_id": arrays["sample_id"],
             "subject_id": arrays["subject_id"],
             "session_id": arrays["session_id"],
@@ -1319,7 +1579,7 @@ def save_success_summary_row(
         "confusion_matrix": metrics["confusion_matrix"].tolist(),
     }
     upsert_summary_row(path, row)
-    write_overall_metrics(path, args.label_mode)
+    write_overall_metrics(path, plan.dataset, plan.model_name, plan.label_protocol)
 
 
 def write_failed_summary_row(path: Path, args: argparse.Namespace, plan: FoldPlan, exc: Exception) -> None:
@@ -1354,6 +1614,12 @@ def write_checkpoint_manifest_row(
     row = {
         "run_id": plan.run_id,
         "created_at": plan.created_at,
+        "dataset": plan.dataset,
+        "model": plan.model_name,
+        "input_channels": plan.input_channels,
+        "input_samples": plan.input_samples,
+        "num_classes": plan.num_classes,
+        "label_protocol": plan.label_protocol,
         "label_mode": args.label_mode,
         "target_subject": plan.target_subject,
         "seed": args.seed,
@@ -1414,7 +1680,7 @@ def write_checkpoint_manifest_row(
     manifest.to_csv(path, index=False)
 
 
-def write_overall_metrics(summary_path: Path, label_mode: str) -> None:
+def write_overall_metrics(summary_path: Path, dataset: str, model_name: str, label_protocol: str) -> None:
     if not summary_path.exists():
         return
     summary = pd.read_csv(summary_path)
@@ -1437,7 +1703,7 @@ def write_overall_metrics(summary_path: Path, label_mode: str) -> None:
     ]
     rows = []
     lines = [
-        f"EEGNet source-only overall metrics ({label_mode})",
+        f"{dataset} {model_name} source-only overall metrics ({label_protocol})",
         "Primary aggregation: subject-wise mean +/- std across completed LOSO folds.",
         f"completed_folds={len(summary)}",
         "",
@@ -1456,8 +1722,9 @@ def write_overall_metrics(summary_path: Path, label_mode: str) -> None:
         rows.append({"metric": metric_name, "mean": mean, "std": std, "n": int(len(valid))})
         lines.append(f"{metric_name}: mean={mean:.6f} std={std:.6f} n={len(valid)}")
 
-    txt_path = summary_path.parent / f"eegnet_source_only_{label_mode}_overall_metrics.txt"
-    csv_path = summary_path.parent / f"eegnet_source_only_{label_mode}_overall_metrics.csv"
+    stem = f"{dataset}_{model_name}_source_only_{label_protocol}_overall_metrics"
+    txt_path = summary_path.parent / f"{stem}.txt"
+    csv_path = summary_path.parent / f"{stem}.csv"
     txt_path.write_text("\n".join(lines) + "\n")
     pd.DataFrame(rows).to_csv(csv_path, index=False)
 
@@ -1466,6 +1733,12 @@ def base_summary_fields(args: argparse.Namespace, plan: FoldPlan) -> dict[str, o
     return {
         "run_id": plan.run_id,
         "created_at": plan.created_at,
+        "dataset": plan.dataset,
+        "model": plan.model_name,
+        "input_channels": plan.input_channels,
+        "input_samples": plan.input_samples,
+        "num_classes": plan.num_classes,
+        "label_protocol": plan.label_protocol,
         "target_subject": plan.target_subject,
         "label_mode": args.label_mode,
         "seed": args.seed,
@@ -1514,6 +1787,9 @@ def base_summary_fields(args: argparse.Namespace, plan: FoldPlan) -> dict[str, o
 def upsert_summary_row(path: Path, row: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     key_cols = [
+        "dataset",
+        "model",
+        "label_protocol",
         "label_mode",
         "target_subject",
         "seed",
@@ -1550,13 +1826,21 @@ def upsert_summary_row(path: Path, row: dict[str, object]) -> None:
         summary = pd.concat([summary, new_row[summary.columns]], ignore_index=True)
     else:
         summary = new_row
-    summary.sort_values(["label_mode", "target_subject", "seed", "class_balance"], inplace=True)
+    summary.sort_values(["dataset", "label_protocol", "target_subject", "seed", "class_balance"], inplace=True)
     summary.to_csv(path, index=False)
 
 
-def print_global_plan_header(args: argparse.Namespace, report: IntegrityReport, target_subjects: list[int]) -> None:
+def print_global_plan_header(args: argparse.Namespace, context: DatasetContext, target_subjects: list[int]) -> None:
     print("global_loso_plan")
+    print(f"  dataset={context.dataset}")
+    print(f"  model={context.model_name}")
+    print(f"  input_channels={context.input_channels}")
+    print(f"  input_samples={context.input_samples}")
+    print(f"  num_classes={context.num_classes}")
+    print(f"  label_protocol={context.label_protocol}")
     print(f"  label_mode={args.label_mode}")
+    if context.dataset == "sadt":
+        print("  label_mode_applicable=False")
     print(f"  class_balance={args.class_balance}")
     print(f"  optimizer={args.optimizer}")
     print(f"  lr={args.lr}")
@@ -1586,14 +1870,24 @@ def print_global_plan_header(args: argparse.Namespace, report: IntegrityReport, 
     print(f"  max_folds={args.max_folds}")
     print(f"  dry_run={args.dry_run}")
     print(f"  selected_targets={target_subjects}")
-    print(f"  included_subject_count={len(report.included_subject_ids)}")
-    print(f"  included_session_count={len(report.valid_file_pairs)}")
-    print(f"  label_rule={report.label_rule}")
+    print(f"  included_subject_count={len(context.subjects)}")
+    if context.integrity_report is not None:
+        print(f"  included_session_count={len(context.integrity_report.valid_file_pairs)}")
+        print(f"  label_rule={context.integrity_report.label_rule}")
+    else:
+        print(f"  included_session_count={len(context.subjects)}")
+        print("  label_rule=rt_binary: 0 alert, 1 fatigue/drowsy")
 
 
 def print_fold_plan(plan: FoldPlan, *, dry_run: bool) -> None:
     prefix = "dry_run_fold_plan" if dry_run else "fold_plan"
     print(prefix)
+    print(f"  dataset={plan.dataset}")
+    print(f"  model={plan.model_name}")
+    print(f"  input_channels={plan.input_channels}")
+    print(f"  input_samples={plan.input_samples}")
+    print(f"  num_classes={plan.num_classes}")
+    print(f"  label_protocol={plan.label_protocol}")
     print(f"  target_subject={plan.target_subject}")
     print(f"  validation_mode={plan.validation_mode}")
     print(f"  validation_strategy={plan.validation_strategy}")
@@ -1632,7 +1926,11 @@ def print_discovery_sanity(file_pairs, subjects: list[int]) -> None:
     print("additional_downsampling_applied=False")
 
 
-def print_source_sanity(train_sessions, val_sessions) -> None:
+def print_source_sanity(train_sessions, val_sessions, context: DatasetContext) -> None:
+    if context.dataset != "seedvig":
+        print(f"final_segment_shape_per_sample=({context.input_channels}, {context.input_samples})")
+        print("source_raw_nan_count=0 source_raw_inf_count=0")
+        return
     sessions = list(train_sessions) + list(val_sessions)
     label_values = np.concatenate([s.y for s in sessions])
     raw_segment_counts = [s.raw_segment_count for s in sessions]
@@ -1666,7 +1964,15 @@ def print_source_split_sanity(train, val) -> None:
         print(f"{name}_label_distribution={dict(zip(values.tolist(), counts.tolist(), strict=False))}")
 
 
-def print_target_sanity(test_sessions, test) -> None:
+def print_target_sanity(test_sessions, test, context: DatasetContext) -> None:
+    if context.dataset != "seedvig":
+        values, counts = np.unique(test["y"], return_counts=True)
+        distribution = dict(zip(values.tolist(), counts.tolist(), strict=False))
+        print(f"target_count={len(test['y'])}")
+        print(f"confirmed_target_segment_shape_per_sample=({context.input_channels}, {context.input_samples})")
+        print(f"target_label_distribution={distribution}")
+        print("target_raw_nan_count=0 target_raw_inf_count=0")
+        return
     raw_segment_counts = [s.raw_segment_count for s in test_sessions]
     nan_total = sum(s.nan_count for s in test_sessions)
     inf_total = sum(s.inf_count for s in test_sessions)
@@ -1793,13 +2099,22 @@ def stratified_metadata_counts(source_counts: dict[str, int], val_ratio: float) 
     return train_counts, val_counts
 
 
-def print_recommended_gpu_command() -> None:
+def print_recommended_gpu_command(args: argparse.Namespace) -> None:
     print("recommended_later_gpu_command")
+    if args.dataset == "sadt":
+        print(
+            "python train_eegnet_source.py --dataset sadt --model eegnet "
+            f"--sadt-path {args.sadt_path} --run-all-loso --epochs 50 --batch-size 64 "
+            "--device cuda --validation-mode sample_stratified "
+            f"--class-balance {args.class_balance}"
+        )
+        return
+
     print(
-        "python train_eegnet_source.py --run-all-loso --epochs 100 --batch-size 64 "
-        "--device cuda --label-mode threshold35 --class-balance weighted_loss "
-        "--optimizer adamw --weight-decay 0.0001 --early-stop-patience 15 "
-        "--monitor-metric macro_f1 --lr-scheduler plateau"
+        "python train_eegnet_source.py --dataset seedvig --model eegnet --run-all-loso "
+        "--epochs 100 --batch-size 64 --device cuda --label-mode threshold35 "
+        "--class-balance weighted_loss --optimizer adamw --weight-decay 0.0001 "
+        "--early-stop-patience 15 --monitor-metric macro_f1 --lr-scheduler plateau"
     )
 
 
