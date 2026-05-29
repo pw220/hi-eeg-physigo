@@ -3,7 +3,10 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
+import os
 from pathlib import Path
+import random
 import shlex
 import sys
 import traceback
@@ -60,6 +63,9 @@ class FoldPlan:
     created_at: str
     command: str
     single_fold_command: str
+    validation_mode: str
+    checkpoint_policy: str
+    validation_strategy: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,6 +99,11 @@ def parse_args() -> argparse.Namespace:
         default="macro_f1",
     )
     parser.add_argument("--val-subject-ratio", type=float, default=0.2)
+    parser.add_argument("--validation-mode", choices=("subject_split", "sample_stratified", "none"), default="subject_split")
+    parser.add_argument("--val-ratio", type=float, default=0.2)
+    parser.add_argument("--checkpoint-policy", choices=("best_val", "last", "fixed_epoch"), default="best_val")
+    parser.add_argument("--fixed-eval-epoch", type=int, default=None)
+    parser.add_argument("--disable-early-stop", action="store_true")
     parser.add_argument("--bandpass", action="store_true")
     parser.add_argument("--robust-clip", action="store_true")
     parser.add_argument("--eegnet-f1", type=int, default=8)
@@ -111,6 +122,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--debug-repro", action="store_true")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda", "mps"))
     parser.add_argument("--min-class-samples", type=int, default=1)
     return parser.parse_args()
@@ -123,7 +136,7 @@ def main() -> None:
     if (args.raw_data_dir is None) != (args.label_dir is None):
         raise ValueError("--raw-data-dir and --label-dir must be provided together")
     validate_training_args(args)
-    set_seed(args.seed)
+    set_seed(args.seed, deterministic=args.deterministic)
     outputs_dir = Path(args.output_dir)
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -167,12 +180,14 @@ def main() -> None:
         return
 
     device = choose_device(args.device)
+    repro_metadata = reproducibility_metadata(args, device)
+    print_reproducibility_metadata(repro_metadata)
     for plan in plans:
         if args.skip_existing and fold_outputs_exist(plan):
             print(f"Skipping target_subject={plan.target_subject}: existing prediction CSV and checkpoint found")
             continue
         try:
-            run_loso_fold(args, integrity_report, plan, device)
+            run_loso_fold(args, integrity_report, plan, device, repro_metadata)
         except Exception as exc:  # noqa: BLE001 - all-LOSO should continue after fold failures
             print(f"Fold target_subject={plan.target_subject} failed: {exc}")
             traceback.print_exc()
@@ -229,6 +244,19 @@ def validate_training_args(args: argparse.Namespace) -> None:
         raise ValueError("--plateau-patience must be non-negative")
     if args.min_lr < 0:
         raise ValueError("--min-lr must be non-negative")
+    if not 0.0 < args.val_subject_ratio < 1.0:
+        raise ValueError("--val-subject-ratio must be between 0 and 1")
+    if not 0.0 < args.val_ratio < 1.0:
+        raise ValueError("--val-ratio must be between 0 and 1")
+    if args.validation_mode == "none" and args.checkpoint_policy == "best_val":
+        raise ValueError("best_val checkpoint policy requires validation-mode != none.")
+    if args.checkpoint_policy == "fixed_epoch":
+        if args.fixed_eval_epoch is None:
+            raise ValueError("--checkpoint-policy fixed_epoch requires --fixed-eval-epoch")
+        if not 1 <= args.fixed_eval_epoch <= args.epochs:
+            raise ValueError("--fixed-eval-epoch must be between 1 and --epochs")
+    if args.validation_mode == "none" and args.early_stop_patience > 0 and not args.disable_early_stop:
+        print("warning: validation-mode=none disables early stopping because no validation metrics are computed")
     if args.eegnet_f1 <= 0 or args.eegnet_d <= 0:
         raise ValueError("--eegnet-f1 and --eegnet-d must be positive")
     if args.eegnet_f2 < 0:
@@ -271,12 +299,43 @@ def plan_loso_fold(
     target_subject: int,
     outputs_dir: Path,
 ) -> FoldPlan:
-    train_pairs, val_pairs, test_pairs = split_loso_file_pairs(
-        file_pairs,
-        target_subject=target_subject,
-        val_subject_ratio=args.val_subject_ratio,
-        seed=args.seed,
-    )
+    source_pairs = [(raw, label) for raw, label in file_pairs if parse_subject_id(raw) != target_subject]
+    test_pairs = [(raw, label) for raw, label in file_pairs if parse_subject_id(raw) == target_subject]
+    if args.validation_mode == "subject_split":
+        train_pairs, val_pairs, test_pairs = split_loso_file_pairs(
+            file_pairs,
+            target_subject=target_subject,
+            val_subject_ratio=args.val_subject_ratio,
+            seed=args.seed,
+        )
+        train_counts = counts_for_pairs(train_pairs, integrity_report)
+        val_counts = counts_for_pairs(val_pairs, integrity_report)
+        train_subject_ids = pair_subjects(train_pairs)
+        val_subject_ids = pair_subjects(val_pairs)
+        validation_strategy = "deterministic source-subject split controlled by seed and val_subject_ratio"
+    elif args.validation_mode == "sample_stratified":
+        if not source_pairs or not test_pairs:
+            raise ValueError("Invalid LOSO split produced an empty source or test partition")
+        train_pairs = source_pairs
+        val_pairs = []
+        source_counts = counts_for_pairs(source_pairs, integrity_report)
+        train_counts, val_counts = stratified_metadata_counts(source_counts, args.val_ratio)
+        train_subject_ids = pair_subjects(source_pairs)
+        val_subject_ids = pair_subjects(source_pairs)
+        validation_strategy = "sample-level stratified validation within source subjects controlled by seed and val_ratio"
+    elif args.validation_mode == "none":
+        if not source_pairs or not test_pairs:
+            raise ValueError("Invalid LOSO split produced an empty source or test partition")
+        train_pairs = source_pairs
+        val_pairs = []
+        train_counts = counts_for_pairs(source_pairs, integrity_report)
+        val_counts = zero_counts()
+        train_subject_ids = pair_subjects(source_pairs)
+        val_subject_ids = []
+        validation_strategy = "no validation set; all non-target source samples used for training"
+    else:
+        raise ValueError(f"Unsupported validation mode: {args.validation_mode}")
+    test_counts = counts_for_pairs(test_pairs, integrity_report)
     created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     run_id = make_run_id(args, target_subject)
     checkpoints_dir = outputs_dir / "checkpoints"
@@ -309,6 +368,10 @@ def plan_loso_fold(
         f"--early-stop-patience {args.early_stop_patience} "
         f"--min-delta {args.min_delta} "
         f"--monitor-metric {args.monitor_metric} "
+        f"--validation-mode {args.validation_mode} "
+        f"--val-ratio {args.val_ratio} "
+        f"--val-subject-ratio {args.val_subject_ratio} "
+        f"--checkpoint-policy {args.checkpoint_policy} "
         f"--device {args.device} "
         f"--label-mode {args.label_mode} "
         f"--class-balance {args.class_balance} "
@@ -330,18 +393,24 @@ def plan_loso_fold(
         command += " --bandpass"
     if args.robust_clip:
         command += " --robust-clip"
+    if args.fixed_eval_epoch is not None:
+        command += f" --fixed-eval-epoch {args.fixed_eval_epoch}"
+    if args.disable_early_stop:
+        command += " --disable-early-stop"
+    if args.deterministic:
+        command += " --deterministic"
 
     return FoldPlan(
         target_subject=target_subject,
         train_pairs=train_pairs,
         val_pairs=val_pairs,
         test_pairs=test_pairs,
-        train_subject_ids=pair_subjects(train_pairs),
-        val_subject_ids=pair_subjects(val_pairs),
+        train_subject_ids=train_subject_ids,
+        val_subject_ids=val_subject_ids,
         test_subject_ids=pair_subjects(test_pairs),
-        train_counts=counts_for_pairs(train_pairs, integrity_report),
-        val_counts=counts_for_pairs(val_pairs, integrity_report),
-        test_counts=counts_for_pairs(test_pairs, integrity_report),
+        train_counts=train_counts,
+        val_counts=val_counts,
+        test_counts=test_counts,
         prediction_path=prediction_path,
         checkpoint_path=checkpoint_path,
         latest_checkpoint_path=latest_checkpoint_path,
@@ -353,6 +422,9 @@ def plan_loso_fold(
         created_at=created_at,
         command=" ".join(shlex.quote(part) for part in [sys.executable, *sys.argv]),
         single_fold_command=command,
+        validation_mode=args.validation_mode,
+        checkpoint_policy=args.checkpoint_policy,
+        validation_strategy=validation_strategy,
     )
 
 
@@ -361,8 +433,9 @@ def run_loso_fold(
     integrity_report: IntegrityReport,
     plan: FoldPlan,
     device: torch.device,
+    repro_metadata: dict[str, object],
 ) -> None:
-    set_seed(args.seed)
+    set_seed(args.seed, deterministic=args.deterministic)
     guard_run_outputs(args, plan)
     write_loso_fold_integrity_report(
         integrity_report,
@@ -372,6 +445,15 @@ def run_loso_fold(
         val_pairs=plan.val_pairs,
         test_pairs=plan.test_pairs,
         robust_clip=args.robust_clip,
+        validation_mode=args.validation_mode,
+        validation_strategy=plan.validation_strategy,
+        val_ratio=args.val_ratio,
+        val_subject_ratio=args.val_subject_ratio,
+        checkpoint_policy=args.checkpoint_policy,
+        early_stop_enabled=early_stop_enabled(args),
+        train_counts=plan.train_counts,
+        val_counts=plan.val_counts,
+        test_counts=plan.test_counts,
     )
     print_integrity_report_summary(
         integrity_report,
@@ -379,26 +461,44 @@ def run_loso_fold(
         train_pairs=plan.train_pairs,
         val_pairs=plan.val_pairs,
         test_pairs=plan.test_pairs,
+        train_counts=plan.train_counts,
+        val_counts=plan.val_counts,
+        test_counts=plan.test_counts,
     )
     print_fold_plan(plan, dry_run=False)
 
     train_sessions = load_seedvig_file_pairs(plan.train_pairs, label_mode=args.label_mode, bandpass=args.bandpass)
-    val_sessions = load_seedvig_file_pairs(plan.val_pairs, label_mode=args.label_mode, bandpass=args.bandpass)
-    train = sessions_to_arrays(train_sessions)
-    val = sessions_to_arrays(val_sessions)
+    if args.validation_mode == "subject_split":
+        val_sessions = load_seedvig_file_pairs(plan.val_pairs, label_mode=args.label_mode, bandpass=args.bandpass)
+        train = sessions_to_arrays(train_sessions)
+        val = sessions_to_arrays(val_sessions)
+    elif args.validation_mode == "sample_stratified":
+        val_sessions = []
+        source = sessions_to_arrays(train_sessions)
+        train, val = split_arrays_stratified(source, val_ratio=args.val_ratio, seed=args.seed)
+    elif args.validation_mode == "none":
+        val_sessions = []
+        train = sessions_to_arrays(train_sessions)
+        val = None
+    else:
+        raise ValueError(f"Unsupported validation mode: {args.validation_mode}")
     assert plan.target_subject not in set(train["subject_id"])
-    assert plan.target_subject not in set(val["subject_id"])
+    if val is not None:
+        assert plan.target_subject not in set(val["subject_id"])
 
     print_source_sanity(train_sessions, val_sessions)
     print_source_split_sanity(train, val)
     train_x, val_x, preprocess_state = preprocess_source(
         train["x"],
-        val["x"],
+        None if val is None else val["x"],
         robust_clip=args.robust_clip,
     )
     train["x"] = train_x
-    val["x"] = val_x
-    print_nan_inf_after_preprocessing(("train", train), ("val", val))
+    if val is not None:
+        val["x"] = val_x
+        print_nan_inf_after_preprocessing(("train", train), ("val", val))
+    else:
+        print_nan_inf_after_preprocessing(("train", train))
 
     # Target labels are loaded after source-only preprocessing state is fixed;
     # they are used only for final evaluation and saved prediction diagnostics.
@@ -409,9 +509,29 @@ def run_loso_fold(
     print_target_sanity(test_sessions, test)
     print_nan_inf_after_preprocessing(("test", test))
 
-    train_loader = make_loader(train, args.batch_size, shuffle=True, num_workers=args.num_workers)
-    val_loader = make_loader(val, args.batch_size, shuffle=False, num_workers=args.num_workers)
-    test_loader = make_loader(test, args.batch_size, shuffle=False, num_workers=args.num_workers)
+    train_loader = make_loader(
+        train,
+        args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        seed=args.seed,
+    )
+    val_loader = None
+    if val is not None:
+        val_loader = make_loader(
+            val,
+            args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            seed=args.seed,
+        )
+    test_loader = make_loader(
+        test,
+        args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        seed=args.seed,
+    )
 
     class_weights = compute_class_weights(train["y"], args.class_balance)
     print_class_balance(train["y"], args.class_balance, class_weights)
@@ -419,10 +539,15 @@ def run_loso_fold(
 
     model_config = eegnet_model_config(args)
     print_model_and_training_config(args, model_config)
+    set_seed(args.seed, deterministic=args.deterministic)
     model = EEGNet(**model_config).to(device)
     optimizer = make_optimizer(model, args)
     scheduler = make_scheduler(optimizer, args)
     criterion = nn.CrossEntropyLoss(weight=criterion_weight)
+    initial_checksum = model_parameter_checksum(model)
+    if args.debug_repro:
+        print(f"debug_repro initial_parameter_checksum={initial_checksum}")
+        print(f"debug_repro first_20_train_sample_ids={first_shuffled_sample_ids(train, args.seed, 20)}")
 
     best_state = None
     best_epoch = 0
@@ -430,6 +555,9 @@ def run_loso_fold(
     best_tie = -1.0
     best_macro_f1 = -1.0
     best_balanced_acc = -1.0
+    selected_state = None
+    selected_epoch = 0
+    selected_reason = ""
     epochs_without_improvement = 0
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(
@@ -440,61 +568,105 @@ def run_loso_fold(
             device,
             grad_clip_norm=args.grad_clip_norm,
         )
-        val_logits, val_y = predict_logits(model, val_loader, device)
-        val_probs = softmax(val_logits)
-        val_pred = val_logits.argmax(axis=1)
-        val_metrics = classification_metrics(val_y, val_pred, val_probs[:, 1])
-        monitor_value = _monitor_value(val_metrics, args.monitor_metric)
-        tie_metric = "balanced_accuracy" if args.monitor_metric == "macro_f1" else "macro_f1"
-        tie_value = _monitor_value(val_metrics, tie_metric)
-        improved = best_state is None or monitor_value > best_monitor + args.min_delta or (
-            np.isclose(monitor_value, best_monitor) and tie_value > best_tie + args.min_delta
-        )
-        if improved:
-            best_epoch = epoch
-            best_monitor = monitor_value
-            best_tie = tie_value
-            best_macro_f1 = float(val_metrics["macro_f1"])
-            best_balanced_acc = float(val_metrics["balanced_accuracy"])
-            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-            epochs_without_improvement = 0
+        if args.debug_repro and epoch == 1:
+            print(f"debug_repro epoch1_parameter_checksum={model_parameter_checksum(model)}")
+        val_metrics = None
+        monitor_value = np.nan
+        if val_loader is not None:
+            val_logits, val_y = predict_logits(model, val_loader, device)
+            val_probs = softmax(val_logits)
+            val_pred = val_logits.argmax(axis=1)
+            val_metrics = classification_metrics(val_y, val_pred, val_probs[:, 1])
+            monitor_value = _monitor_value(val_metrics, args.monitor_metric)
+            tie_metric = "balanced_accuracy" if args.monitor_metric == "macro_f1" else "macro_f1"
+            tie_value = _monitor_value(val_metrics, tie_metric)
+            improved = best_state is None or monitor_value > best_monitor + args.min_delta or (
+                np.isclose(monitor_value, best_monitor) and tie_value > best_tie + args.min_delta
+            )
+            if improved:
+                best_epoch = epoch
+                best_monitor = monitor_value
+                best_tie = tie_value
+                best_macro_f1 = float(val_metrics["macro_f1"])
+                best_balanced_acc = float(val_metrics["balanced_accuracy"])
+                best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
         else:
-            epochs_without_improvement += 1
-        if scheduler is not None:
+            epochs_without_improvement = 0
+
+        if args.checkpoint_policy == "last":
+            selected_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            selected_epoch = epoch
+            selected_reason = "last"
+        elif args.checkpoint_policy == "fixed_epoch" and epoch == args.fixed_eval_epoch:
+            selected_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            selected_epoch = epoch
+            selected_reason = f"fixed_epoch_{epoch}"
+
+        if scheduler is not None and val_metrics is not None:
             scheduler.step(monitor_value)
         current_lr = optimizer.param_groups[0]["lr"]
-        print(
-            f"target_subject={plan.target_subject} epoch={epoch:03d} train_loss={train_loss:.4f} "
-            f"val_macro_f1={val_metrics['macro_f1']:.4f} "
-            f"val_bal_acc={val_metrics['balanced_accuracy']:.4f} "
-            f"monitor={args.monitor_metric}:{monitor_value:.4f} "
-            f"lr={current_lr:.6g} "
-            f"no_improve={epochs_without_improvement}"
-        )
-        if args.early_stop_patience > 0 and epochs_without_improvement >= args.early_stop_patience:
+        if val_metrics is None:
+            print(
+                f"target_subject={plan.target_subject} epoch={epoch:03d} train_loss={train_loss:.4f} "
+                f"validation_mode=none checkpoint_policy={args.checkpoint_policy} "
+                f"lr={current_lr:.6g}"
+            )
+        else:
+            print(
+                f"target_subject={plan.target_subject} epoch={epoch:03d} train_loss={train_loss:.4f} "
+                f"val_macro_f1={val_metrics['macro_f1']:.4f} "
+                f"val_bal_acc={val_metrics['balanced_accuracy']:.4f} "
+                f"monitor={args.monitor_metric}:{monitor_value:.4f} "
+                f"lr={current_lr:.6g} "
+                f"no_improve={epochs_without_improvement}"
+            )
+        if early_stop_enabled(args) and epochs_without_improvement >= args.early_stop_patience:
             print(
                 f"early_stopping_triggered epoch={epoch} "
                 f"best_epoch={best_epoch} monitor_metric={args.monitor_metric} best_monitor={best_monitor:.4f}"
             )
             break
 
-    if best_state is None:
-        raise RuntimeError("Training did not produce a best model")
-    model.load_state_dict(best_state)
-    save_validation_subject_metrics(model, val, plan.val_metrics_path, device, args.batch_size, args.num_workers)
+    if args.checkpoint_policy == "best_val":
+        if best_state is None:
+            raise RuntimeError("Training did not produce a best validation model")
+        selected_state = best_state
+        selected_epoch = best_epoch
+        selected_reason = f"best_val_{args.monitor_metric}"
+    if selected_state is None:
+        raise RuntimeError(f"Training did not produce a checkpoint for policy={args.checkpoint_policy}")
+    if args.debug_repro:
+        print(f"debug_repro best_epoch={best_epoch} best_validation_metric={best_monitor:.10f}")
+        print(f"debug_repro selected_epoch={selected_epoch} selected_reason={selected_reason}")
+    model.load_state_dict(selected_state)
+    if val is not None:
+        save_validation_subject_metrics(
+            model,
+            val,
+            plan.val_metrics_path,
+            device,
+            args.batch_size,
+            args.num_workers,
+            args.seed,
+        )
 
     test_logits, test_y = predict_logits(model, test_loader, device)
     test_probs = softmax(test_logits)
     test_pred = test_probs.argmax(axis=1)
     test_metrics = classification_metrics(test_y, test_pred, test_probs[:, 1])
     print_final_metrics(test_metrics)
+    has_validation = val_loader is not None
 
     save_predictions(plan.prediction_path, test, test_y, test_pred, test_probs)
     checkpoint = {
         "run_id": plan.run_id,
         "created_at": plan.created_at,
         "command": plan.command,
-        "model_state_dict": best_state,
+        "reproducibility": repro_metadata,
+        "model_state_dict": selected_state,
         "model_config": model_config,
         "training_config": training_config(args),
         "args": vars(args),
@@ -508,11 +680,18 @@ def run_loso_fold(
         "normalization_std": torch.from_numpy(preprocess_state["std"].copy()),
         "clipping_thresholds": tensorize_clip_bounds(preprocess_state["clip_bounds"]),
         "class_weights": None if class_weights is None else class_weights.tolist(),
-        "best_epoch": best_epoch,
+        "best_epoch": None if not has_validation else best_epoch,
+        "selected_epoch": selected_epoch,
+        "selected_reason": selected_reason,
+        "validation_mode": args.validation_mode,
+        "val_ratio": args.val_ratio,
+        "val_subject_ratio": args.val_subject_ratio,
+        "checkpoint_policy": args.checkpoint_policy,
+        "early_stop_enabled": early_stop_enabled(args),
         "best_val_metric": {
-            "macro_f1": best_macro_f1,
-            "balanced_accuracy": best_balanced_acc,
-            args.monitor_metric: best_monitor,
+            "macro_f1": None if not has_validation else best_macro_f1,
+            "balanced_accuracy": None if not has_validation else best_balanced_acc,
+            args.monitor_metric: None if not has_validation else best_monitor,
         },
         "final_metrics": serializable_metrics(test_metrics),
     }
@@ -527,17 +706,19 @@ def run_loso_fold(
         plan=plan,
         metrics=test_metrics,
         class_weights=class_weights,
-        best_epoch=best_epoch,
-        best_macro_f1=best_macro_f1,
-        best_balanced_acc=best_balanced_acc,
-        best_monitor=best_monitor,
+        best_epoch=None if val_loader is None else best_epoch,
+        best_macro_f1=np.nan if val_loader is None else best_macro_f1,
+        best_balanced_acc=np.nan if val_loader is None else best_balanced_acc,
+        best_monitor=np.nan if val_loader is None else best_monitor,
+        selected_epoch=selected_epoch,
+        selected_reason=selected_reason,
     )
     write_checkpoint_manifest_row(
         plan.manifest_path,
         args,
         plan,
         status="success",
-        best_epoch=best_epoch,
+        best_epoch=selected_epoch,
         best_val_metric=best_monitor,
         error="",
     )
@@ -546,7 +727,8 @@ def run_loso_fold(
     if plan.latest_checkpoint_path is not None:
         print(f"Saved latest checkpoint: {plan.latest_checkpoint_path}")
     print(f"Saved summary: {plan.summary_path}")
-    print(f"Saved validation metrics: {plan.val_metrics_path}")
+    if val is not None:
+        print(f"Saved validation metrics: {plan.val_metrics_path}")
 
 
 def choose_device(requested: str) -> torch.device:
@@ -557,6 +739,54 @@ def choose_device(requested: str) -> torch.device:
             return torch.device("mps")
         return torch.device("cpu")
     return torch.device(requested)
+
+
+def reproducibility_metadata(args: argparse.Namespace, device: torch.device) -> dict[str, object]:
+    cuda_available = torch.cuda.is_available()
+    cuda_device_name = torch.cuda.get_device_name(0) if cuda_available else ""
+    git_commit = get_git_commit_hash()
+    return {
+        "seed": args.seed,
+        "deterministic": args.deterministic,
+        "torch_version": torch.__version__,
+        "cuda_available": cuda_available,
+        "cuda_version": torch.version.cuda,
+        "cuda_device_name": cuda_device_name,
+        "device": str(device),
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "num_workers": args.num_workers,
+        "train_dataloader_shuffle": True,
+        "val_dataloader_shuffle": False,
+        "test_dataloader_shuffle": False,
+        "dataloader_generator_seed": args.seed,
+        "pythonhashseed": os.environ.get("PYTHONHASHSEED", ""),
+        "command": " ".join(shlex.quote(part) for part in [sys.executable, *sys.argv]),
+        "git_commit": git_commit,
+    }
+
+
+def print_reproducibility_metadata(metadata: dict[str, object]) -> None:
+    print("reproducibility")
+    for key, value in metadata.items():
+        print(f"  {key}={value}")
+
+
+def get_git_commit_hash() -> str:
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
 
 
 def split_loso_file_pairs(file_pairs, *, target_subject: int, val_subject_ratio: float, seed: int):
@@ -576,17 +806,52 @@ def split_loso_file_pairs(file_pairs, *, target_subject: int, val_subject_ratio:
     return train_pairs, val_pairs, test_pairs
 
 
-def preprocess_source(train_x: np.ndarray, val_x: np.ndarray, *, robust_clip: bool):
+def split_arrays_stratified(
+    arrays: dict[str, np.ndarray],
+    *,
+    val_ratio: float,
+    seed: int,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    rng = np.random.default_rng(seed)
+    y = arrays["y"].astype(np.int64, copy=False)
+    train_indices = []
+    val_indices = []
+    for label in (0, 1):
+        label_indices = np.flatnonzero(y == label)
+        if len(label_indices) == 0:
+            raise ValueError(f"Cannot stratify validation split because class {label} has no source samples")
+        shuffled = label_indices.copy()
+        rng.shuffle(shuffled)
+        val_count = max(1, int(round(len(shuffled) * val_ratio)))
+        if val_count >= len(shuffled):
+            raise ValueError(f"Validation split would consume all class {label} samples")
+        val_indices.append(shuffled[:val_count])
+        train_indices.append(shuffled[val_count:])
+    train_idx = np.concatenate(train_indices)
+    val_idx = np.concatenate(val_indices)
+    rng.shuffle(train_idx)
+    rng.shuffle(val_idx)
+    return index_arrays(arrays, train_idx), index_arrays(arrays, val_idx)
+
+
+def index_arrays(arrays: dict[str, np.ndarray], indices: np.ndarray) -> dict[str, np.ndarray]:
+    return {key: value[indices] for key, value in arrays.items()}
+
+
+def preprocess_source(train_x: np.ndarray, val_x: np.ndarray | None, *, robust_clip: bool):
     clip_bounds = None
     if robust_clip:
         lo, hi = compute_robust_clip_bounds(train_x)
         train_x = apply_robust_clip(train_x, lo, hi)
-        val_x = apply_robust_clip(val_x, lo, hi)
+        if val_x is not None:
+            val_x = apply_robust_clip(val_x, lo, hi)
         clip_bounds = (lo, hi)
 
     mean, std = compute_channel_stats(train_x)
     state = {"clip_bounds": clip_bounds, "mean": mean, "std": std}
-    return apply_channel_zscore(train_x, mean, std), apply_channel_zscore(val_x, mean, std), state
+    train_x = apply_channel_zscore(train_x, mean, std)
+    val_x = None if val_x is None else apply_channel_zscore(val_x, mean, std)
+    return train_x, val_x, state
 
 
 def preprocess_target(test_x: np.ndarray, state: dict[str, object]) -> np.ndarray:
@@ -607,16 +872,36 @@ def tensorize_clip_bounds(clip_bounds):
     }
 
 
-def make_loader(arrays: dict[str, np.ndarray], batch_size: int, *, shuffle: bool, num_workers: int) -> DataLoader:
+def make_loader(
+    arrays: dict[str, np.ndarray],
+    batch_size: int,
+    *,
+    shuffle: bool,
+    num_workers: int,
+    seed: int,
+) -> DataLoader:
     x = torch.from_numpy(arrays["x"]).float().unsqueeze(1)
     y = torch.from_numpy(arrays["y"]).long()
+    generator = torch.Generator()
+    generator.manual_seed(seed)
     return DataLoader(
         TensorDataset(x, y),
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
+        generator=generator,
+        worker_init_fn=make_seed_worker(seed) if num_workers > 0 else None,
     )
+
+
+def make_seed_worker(seed: int):
+    def seed_worker(worker_id: int) -> None:
+        worker_seed = seed + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    return seed_worker
 
 
 def eegnet_model_config(args: argparse.Namespace) -> dict[str, object]:
@@ -646,9 +931,20 @@ def training_config(args: argparse.Namespace) -> dict[str, object]:
         "plateau_patience": args.plateau_patience,
         "min_lr": args.min_lr,
         "early_stop_patience": args.early_stop_patience,
+        "disable_early_stop": args.disable_early_stop,
+        "early_stop_enabled": early_stop_enabled(args),
+        "validation_mode": args.validation_mode,
+        "val_ratio": args.val_ratio,
+        "val_subject_ratio": args.val_subject_ratio,
+        "checkpoint_policy": args.checkpoint_policy,
+        "fixed_eval_epoch": args.fixed_eval_epoch,
         "min_delta": args.min_delta,
         "monitor_metric": args.monitor_metric,
     }
+
+
+def early_stop_enabled(args: argparse.Namespace) -> bool:
+    return args.validation_mode != "none" and not args.disable_early_stop and args.early_stop_patience > 0
 
 
 def print_model_and_training_config(args: argparse.Namespace, model_config: dict[str, object]) -> None:
@@ -740,6 +1036,22 @@ def train_one_epoch(
     return total_loss / max(total_count, 1)
 
 
+def first_shuffled_sample_ids(arrays: dict[str, np.ndarray], seed: int, n: int) -> list[str]:
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    permutation = torch.randperm(len(arrays["y"]), generator=generator).numpy()
+    return [str(arrays["sample_id"][idx]) for idx in permutation[:n]]
+
+
+def model_parameter_checksum(model: nn.Module) -> str:
+    digest = hashlib.sha256()
+    with torch.no_grad():
+        for _, parameter in model.state_dict().items():
+            tensor = parameter.detach().cpu().contiguous()
+            digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
+
+
 @torch.no_grad()
 def predict_logits(model, loader, device: torch.device) -> tuple[np.ndarray, np.ndarray]:
     model.eval()
@@ -766,6 +1078,7 @@ def save_validation_subject_metrics(
     device: torch.device,
     batch_size: int,
     num_workers: int,
+    seed: int,
 ) -> None:
     rows = []
     for subject_id in sorted({int(subject) for subject in val["subject_id"]}):
@@ -774,7 +1087,7 @@ def save_validation_subject_metrics(
             "x": np.ascontiguousarray(val["x"][mask]),
             "y": np.ascontiguousarray(val["y"][mask]),
         }
-        loader = make_loader(subject_arrays, batch_size, shuffle=False, num_workers=num_workers)
+        loader = make_loader(subject_arrays, batch_size, shuffle=False, num_workers=num_workers, seed=seed)
         logits, y_true = predict_logits(model, loader, device)
         probs = softmax(logits)
         y_pred = probs.argmax(axis=1)
@@ -856,10 +1169,12 @@ def save_success_summary_row(
     plan: FoldPlan,
     metrics: dict[str, object],
     class_weights: np.ndarray | None,
-    best_epoch: int,
+    best_epoch: int | None,
     best_macro_f1: float,
     best_balanced_acc: float,
     best_monitor: float,
+    selected_epoch: int,
+    selected_reason: str,
 ) -> None:
     row = {
         **base_summary_fields(args, plan),
@@ -883,6 +1198,8 @@ def save_success_summary_row(
         "best_val_macro_f1": best_macro_f1,
         "best_val_balanced_accuracy": best_balanced_acc,
         "best_val_metric": best_monitor,
+        "selected_epoch": selected_epoch,
+        "selected_reason": selected_reason,
         "monitor_metric": args.monitor_metric,
         "accuracy": metrics["accuracy"],
         "balanced_accuracy": metrics["balanced_accuracy"],
@@ -952,12 +1269,25 @@ def write_checkpoint_manifest_row(
         "seed": args.seed,
         "class_balance": args.class_balance,
         "epochs": args.epochs,
+        "deterministic": args.deterministic,
+        "num_workers": args.num_workers,
+        "validation_mode": args.validation_mode,
+        "val_ratio": args.val_ratio,
+        "val_subject_ratio": args.val_subject_ratio,
+        "checkpoint_policy": args.checkpoint_policy,
+        "fixed_eval_epoch": args.fixed_eval_epoch,
+        "disable_early_stop": args.disable_early_stop,
+        "early_stop_enabled": early_stop_enabled(args),
         "best_epoch": best_epoch,
         "best_val_metric": best_val_metric,
         "monitor_metric": args.monitor_metric,
         "optimizer": args.optimizer,
         "weight_decay": args.weight_decay,
         "early_stop_patience": args.early_stop_patience,
+        "train_sample_count": plan.train_counts["usable"],
+        "val_sample_count": plan.val_counts["usable"],
+        "train_subject_count": len(plan.train_subject_ids),
+        "val_subject_count": len(plan.val_subject_ids),
         "eegnet_f1": args.eegnet_f1,
         "eegnet_d": args.eegnet_d,
         "eegnet_f2": args.eegnet_f2,
@@ -1054,11 +1384,25 @@ def base_summary_fields(args: argparse.Namespace, plan: FoldPlan) -> dict[str, o
         "lr": args.lr,
         "bandpass": args.bandpass,
         "robust_clip": args.robust_clip,
+        "deterministic": args.deterministic,
+        "debug_repro": args.debug_repro,
+        "num_workers": args.num_workers,
         "optimizer": args.optimizer,
         "weight_decay": args.weight_decay,
         "grad_clip_norm": args.grad_clip_norm,
         "lr_scheduler": args.lr_scheduler,
         "early_stop_patience": args.early_stop_patience,
+        "validation_mode": args.validation_mode,
+        "val_ratio": args.val_ratio,
+        "val_subject_ratio": args.val_subject_ratio,
+        "train_subject_count": len(plan.train_subject_ids),
+        "val_subject_count": len(plan.val_subject_ids),
+        "train_sample_count": plan.train_counts["usable"],
+        "val_sample_count": plan.val_counts["usable"],
+        "checkpoint_policy": args.checkpoint_policy,
+        "fixed_eval_epoch": args.fixed_eval_epoch,
+        "disable_early_stop": args.disable_early_stop,
+        "early_stop_enabled": early_stop_enabled(args),
         "min_delta": args.min_delta,
         "monitor_metric": args.monitor_metric,
         "eegnet_f1": args.eegnet_f1,
@@ -1086,6 +1430,8 @@ def upsert_summary_row(path: Path, row: dict[str, object]) -> None:
         "lr",
         "weight_decay",
         "monitor_metric",
+        "validation_mode",
+        "checkpoint_policy",
         "eegnet_f1",
         "eegnet_d",
         "eegnet_f2",
@@ -1125,6 +1471,12 @@ def print_global_plan_header(args: argparse.Namespace, report: IntegrityReport, 
     print(f"  weight_decay={args.weight_decay}")
     print(f"  early_stop_patience={args.early_stop_patience}")
     print(f"  monitor_metric={args.monitor_metric}")
+    print(f"  validation_mode={args.validation_mode}")
+    print(f"  val_subject_ratio={args.val_subject_ratio}")
+    print(f"  val_ratio={args.val_ratio}")
+    print(f"  checkpoint_policy={args.checkpoint_policy}")
+    print(f"  fixed_eval_epoch={args.fixed_eval_epoch}")
+    print(f"  early_stop_enabled={early_stop_enabled(args)}")
     print(
         "  eegnet="
         f"f1:{args.eegnet_f1},d:{args.eegnet_d},f2:{args.eegnet_f2},"
@@ -1150,6 +1502,9 @@ def print_fold_plan(plan: FoldPlan, *, dry_run: bool) -> None:
     prefix = "dry_run_fold_plan" if dry_run else "fold_plan"
     print(prefix)
     print(f"  target_subject={plan.target_subject}")
+    print(f"  validation_mode={plan.validation_mode}")
+    print(f"  validation_strategy={plan.validation_strategy}")
+    print(f"  checkpoint_policy={plan.checkpoint_policy}")
     print(f"  train_subject_ids={plan.train_subject_ids}")
     print(f"  val_subject_ids={plan.val_subject_ids}")
     print(f"  test_subject_ids={plan.test_subject_ids}")
@@ -1201,13 +1556,18 @@ def print_source_sanity(train_sessions, val_sessions) -> None:
 
 
 def print_source_split_sanity(train, val) -> None:
-    print(f"split_counts train={len(train['y'])} val={len(val['y'])}")
+    val_count = 0 if val is None else len(val["y"])
+    val_subjects = [] if val is None else sorted(int(s) for s in set(val["subject_id"]))
+    print(f"split_counts train={len(train['y'])} val={val_count}")
     print(
         "split_subjects "
         f"train={sorted(int(s) for s in set(train['subject_id']))} "
-        f"val={sorted(int(s) for s in set(val['subject_id']))}"
+        f"val={val_subjects}"
     )
-    for name, arrays in (("train", train), ("val", val)):
+    named_arrays = [("train", train)]
+    if val is not None:
+        named_arrays.append(("val", val))
+    for name, arrays in named_arrays:
         values, counts = np.unique(arrays["y"], return_counts=True)
         print(f"{name}_label_distribution={dict(zip(values.tolist(), counts.tolist(), strict=False))}")
 
@@ -1270,6 +1630,32 @@ def counts_for_pairs(pairs: list[tuple[Path, Path]], report: IntegrityReport) ->
         counts["fatigue"] += session.fatigue_count
         counts["excluded"] += session.excluded_count
     return counts
+
+
+def zero_counts() -> dict[str, int]:
+    return {"sessions": 0, "usable": 0, "alert": 0, "fatigue": 0, "excluded": 0}
+
+
+def stratified_metadata_counts(source_counts: dict[str, int], val_ratio: float) -> tuple[dict[str, int], dict[str, int]]:
+    val_alert = int(round(source_counts["alert"] * val_ratio))
+    val_fatigue = int(round(source_counts["fatigue"] * val_ratio))
+    val_counts = {
+        "sessions": source_counts["sessions"],
+        "usable": val_alert + val_fatigue,
+        "alert": val_alert,
+        "fatigue": val_fatigue,
+        "excluded": 0,
+    }
+    train_alert = source_counts["alert"] - val_alert
+    train_fatigue = source_counts["fatigue"] - val_fatigue
+    train_counts = {
+        "sessions": source_counts["sessions"],
+        "usable": train_alert + train_fatigue,
+        "alert": train_alert,
+        "fatigue": train_fatigue,
+        "excluded": source_counts["excluded"],
+    }
+    return train_counts, val_counts
 
 
 def print_recommended_gpu_command() -> None:

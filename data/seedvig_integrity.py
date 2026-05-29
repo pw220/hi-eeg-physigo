@@ -272,6 +272,15 @@ def write_loso_fold_integrity_report(
     val_pairs: Iterable[tuple[Path, Path]],
     test_pairs: Iterable[tuple[Path, Path]],
     robust_clip: bool,
+    validation_mode: str = "subject_split",
+    validation_strategy: str = "deterministic source-subject split controlled by seed and val_subject_ratio",
+    val_ratio: float | None = None,
+    val_subject_ratio: float | None = None,
+    checkpoint_policy: str = "best_val",
+    early_stop_enabled: bool = False,
+    train_counts: dict[str, int] | None = None,
+    val_counts: dict[str, int] | None = None,
+    test_counts: dict[str, int] | None = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -318,8 +327,21 @@ def write_loso_fold_integrity_report(
             f"Test subject IDs: {test_subjects}",
         ]
     )
+    explicit_counts = {"train": train_counts, "val": val_counts, "test": test_counts}
+    lines.extend(
+        [
+            f"Validation mode: {validation_mode}",
+            f"Validation strategy: {validation_strategy}",
+            f"val_subject_ratio: {val_subject_ratio}",
+            f"val_ratio: {val_ratio}",
+            f"Checkpoint policy: {checkpoint_policy}",
+            f"Early stopping enabled: {early_stop_enabled}",
+            "Target labels are audit/evaluation only.",
+            "No target samples were used for training, validation, preprocessing statistics, class weights, or model selection.",
+        ]
+    )
     for name, pairs in (("train", train_pairs), ("val", val_pairs), ("test", test_pairs)):
-        counts = _counts_for_pairs(pairs, session_by_id)
+        counts = explicit_counts[name] if explicit_counts[name] is not None else _counts_for_pairs(pairs, session_by_id)
         lines.append(
             f"{name}: sessions={counts['sessions']}, usable={counts['usable']}, "
             f"alert={counts['alert']}, fatigue={counts['fatigue']}"
@@ -344,6 +366,9 @@ def print_integrity_report_summary(
     train_pairs: Iterable[tuple[Path, Path]],
     val_pairs: Iterable[tuple[Path, Path]],
     test_pairs: Iterable[tuple[Path, Path]],
+    train_counts: dict[str, int] | None = None,
+    val_counts: dict[str, int] | None = None,
+    test_counts: dict[str, int] | None = None,
 ) -> None:
     session_by_id = {session.session_id: session for session in report.sessions}
     print("integrity_report_summary")
@@ -354,8 +379,9 @@ def print_integrity_report_summary(
     print(f"  label_rule={report.label_rule}")
     excluded = [s for s in report.sessions if not s.included]
     print(f"  excluded_sessions={len(excluded)}")
+    explicit_counts = {"train": train_counts, "val": val_counts, "test": test_counts}
     for name, pairs in (("train", train_pairs), ("val", val_pairs), ("test", test_pairs)):
-        counts = _counts_for_pairs(pairs, session_by_id)
+        counts = explicit_counts[name] if explicit_counts[name] is not None else _counts_for_pairs(pairs, session_by_id)
         print(
             f"  {name}: sessions={counts['sessions']} usable={counts['usable']} "
             f"alert={counts['alert']} fatigue={counts['fatigue']} excluded={counts['excluded']}"
