@@ -573,9 +573,9 @@ def run_loso_fold(
     best_tie = -1.0
     best_macro_f1 = -1.0
     best_balanced_acc = -1.0
-    best_train_auc = -np.inf
-    best_train_auc_epoch = 0
-    best_train_auc_metrics = None
+    best_target_diagnostic_auc = -np.inf
+    best_target_diagnostic_epoch = 0
+    best_target_diagnostic_metrics = None
     selected_state = None
     selected_epoch = 0
     selected_reason = ""
@@ -589,11 +589,6 @@ def run_loso_fold(
             device,
             grad_clip_norm=args.grad_clip_norm,
         )
-        train_auc = _monitor_value(train_metrics, "roc_auc")
-        if train_auc > best_train_auc:
-            best_train_auc = train_auc
-            best_train_auc_epoch = epoch
-            best_train_auc_metrics = train_metrics
         if args.debug_repro and epoch == 1:
             print(f"debug_repro epoch1_parameter_checksum={model_parameter_checksum(model)}")
         val_metrics = None
@@ -656,6 +651,11 @@ def run_loso_fold(
         if args.test_every_epochs > 0 and epoch % args.test_every_epochs == 0:
             epoch_metrics = evaluate_current_model_on_target(model, test_loader, device)
             test_metrics_history.append(metrics_history_row(epoch, epoch_metrics, reason="interval_diagnostic"))
+            epoch_target_auc = _monitor_value(epoch_metrics, "roc_auc")
+            if epoch_target_auc > best_target_diagnostic_auc:
+                best_target_diagnostic_auc = epoch_target_auc
+                best_target_diagnostic_epoch = epoch
+                best_target_diagnostic_metrics = epoch_metrics
             print_epoch_test_metrics(plan.target_subject, epoch, epoch_metrics)
         if early_stop_enabled(args) and epochs_without_improvement >= args.early_stop_patience:
             print(
@@ -675,8 +675,8 @@ def run_loso_fold(
     if args.debug_repro:
         print(f"debug_repro best_epoch={best_epoch} best_validation_metric={best_monitor:.10f}")
         print(f"debug_repro selected_epoch={selected_epoch} selected_reason={selected_reason}")
-    if best_train_auc_metrics is not None:
-        print_best_train_auc_metrics(best_train_auc_epoch, best_train_auc_metrics)
+    if best_target_diagnostic_metrics is not None:
+        print_best_target_diagnostic_metrics(best_target_diagnostic_epoch, best_target_diagnostic_metrics)
     model.load_state_dict(selected_state)
     if val is not None:
         save_validation_subject_metrics(
@@ -720,8 +720,10 @@ def run_loso_fold(
         "clipping_thresholds": tensorize_clip_bounds(preprocess_state["clip_bounds"]),
         "class_weights": None if class_weights is None else class_weights.tolist(),
         "best_epoch": None if not has_validation else best_epoch,
-        "best_train_auc_epoch": best_train_auc_epoch,
-        "best_train_auc_metrics": None if best_train_auc_metrics is None else serializable_metrics(best_train_auc_metrics),
+        "best_target_diagnostic_epoch": best_target_diagnostic_epoch,
+        "best_target_diagnostic_metrics": (
+            None if best_target_diagnostic_metrics is None else serializable_metrics(best_target_diagnostic_metrics)
+        ),
         "selected_epoch": selected_epoch,
         "selected_reason": selected_reason,
         "validation_mode": args.validation_mode,
@@ -1707,8 +1709,10 @@ def print_final_metrics(metrics: dict[str, object]) -> None:
     print(metrics["confusion_matrix"])
 
 
-def print_best_train_auc_metrics(epoch: int, metrics: dict[str, object]) -> None:
-    print("best_train_auc_epoch_metrics")
+def print_best_target_diagnostic_metrics(epoch: int, metrics: dict[str, object]) -> None:
+    print("best_target_diagnostic_auc_epoch_metrics")
+    print("  selection_scope: interval target diagnostic evaluations only")
+    print("  note: target diagnostics are not used for training, checkpoint selection, early stopping, or model selection")
     print(f"  epoch: {epoch}")
     for key in (
         "roc_auc",
