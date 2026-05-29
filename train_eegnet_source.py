@@ -573,12 +573,15 @@ def run_loso_fold(
     best_tie = -1.0
     best_macro_f1 = -1.0
     best_balanced_acc = -1.0
+    best_train_auc = -np.inf
+    best_train_auc_epoch = 0
+    best_train_auc_metrics = None
     selected_state = None
     selected_epoch = 0
     selected_reason = ""
     epochs_without_improvement = 0
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(
+        train_loss, train_metrics = train_one_epoch(
             model,
             train_loader,
             optimizer,
@@ -586,6 +589,11 @@ def run_loso_fold(
             device,
             grad_clip_norm=args.grad_clip_norm,
         )
+        train_auc = _monitor_value(train_metrics, "roc_auc")
+        if train_auc > best_train_auc:
+            best_train_auc = train_auc
+            best_train_auc_epoch = epoch
+            best_train_auc_metrics = train_metrics
         if args.debug_repro and epoch == 1:
             print(f"debug_repro epoch1_parameter_checksum={model_parameter_checksum(model)}")
         val_metrics = None
@@ -629,12 +637,16 @@ def run_loso_fold(
         if val_metrics is None:
             print(
                 f"target_subject={plan.target_subject} epoch={epoch:03d} train_loss={train_loss:.4f} "
+                f"train_roc_auc={format_metric(train_metrics['roc_auc'])} "
+                f"train_macro_f1={format_metric(train_metrics['macro_f1'])} "
                 f"validation_mode=none checkpoint_policy={args.checkpoint_policy} "
                 f"lr={current_lr:.6g}"
             )
         else:
             print(
                 f"target_subject={plan.target_subject} epoch={epoch:03d} train_loss={train_loss:.4f} "
+                f"train_roc_auc={format_metric(train_metrics['roc_auc'])} "
+                f"train_macro_f1={format_metric(train_metrics['macro_f1'])} "
                 f"val_macro_f1={val_metrics['macro_f1']:.4f} "
                 f"val_bal_acc={val_metrics['balanced_accuracy']:.4f} "
                 f"monitor={args.monitor_metric}:{monitor_value:.4f} "
@@ -663,6 +675,8 @@ def run_loso_fold(
     if args.debug_repro:
         print(f"debug_repro best_epoch={best_epoch} best_validation_metric={best_monitor:.10f}")
         print(f"debug_repro selected_epoch={selected_epoch} selected_reason={selected_reason}")
+    if best_train_auc_metrics is not None:
+        print_best_train_auc_metrics(best_train_auc_epoch, best_train_auc_metrics)
     model.load_state_dict(selected_state)
     if val is not None:
         save_validation_subject_metrics(
@@ -706,6 +720,8 @@ def run_loso_fold(
         "clipping_thresholds": tensorize_clip_bounds(preprocess_state["clip_bounds"]),
         "class_weights": None if class_weights is None else class_weights.tolist(),
         "best_epoch": None if not has_validation else best_epoch,
+        "best_train_auc_epoch": best_train_auc_epoch,
+        "best_train_auc_metrics": None if best_train_auc_metrics is None else serializable_metrics(best_train_auc_metrics),
         "selected_epoch": selected_epoch,
         "selected_reason": selected_reason,
         "validation_mode": args.validation_mode,
@@ -1045,10 +1061,12 @@ def train_one_epoch(
     device: torch.device,
     *,
     grad_clip_norm: float,
-) -> float:
+) -> tuple[float, dict[str, object]]:
     model.train()
     total_loss = 0.0
     total_count = 0
+    logits_list = []
+    y_list = []
     for x, y in tqdm(loader, desc="train", leave=False):
         x = x.to(device)
         y = y.to(device)
@@ -1063,7 +1081,14 @@ def train_one_epoch(
             model.apply_max_norm_constraints()
         total_loss += float(loss.item()) * len(y)
         total_count += len(y)
-    return total_loss / max(total_count, 1)
+        logits_list.append(logits.detach().cpu().numpy())
+        y_list.append(y.detach().cpu().numpy())
+    logits_np = np.concatenate(logits_list, axis=0)
+    y_np = np.concatenate(y_list, axis=0)
+    probs = softmax(logits_np)
+    y_pred = probs.argmax(axis=1)
+    metrics = classification_metrics(y_np, y_pred, probs[:, 1])
+    return total_loss / max(total_count, 1), metrics
 
 
 def first_shuffled_sample_ids(arrays: dict[str, np.ndarray], seed: int, n: int) -> list[str]:
@@ -1682,16 +1707,43 @@ def print_final_metrics(metrics: dict[str, object]) -> None:
     print(metrics["confusion_matrix"])
 
 
+def print_best_train_auc_metrics(epoch: int, metrics: dict[str, object]) -> None:
+    print("best_train_auc_epoch_metrics")
+    print(f"  epoch: {epoch}")
+    for key in (
+        "roc_auc",
+        "auprc",
+        "accuracy",
+        "balanced_accuracy",
+        "macro_f1",
+        "fatigue_recall",
+        "sensitivity",
+        "alert_recall",
+        "specificity",
+        "miss_rate",
+    ):
+        print(f"  {key}: {format_metric(metrics[key])}")
+    print("confusion_matrix")
+    print(metrics["confusion_matrix"])
+
+
 def print_epoch_test_metrics(target_subject: int, epoch: int, metrics: dict[str, object]) -> None:
     print(
         f"target_diagnostic_metrics target_subject={target_subject} epoch={epoch:03d} "
-        f"accuracy={float(metrics['accuracy']):.4f} "
-        f"balanced_accuracy={float(metrics['balanced_accuracy']):.4f} "
-        f"macro_f1={float(metrics['macro_f1']):.4f} "
-        f"sensitivity={float(metrics['sensitivity']):.4f} "
-        f"specificity={float(metrics['specificity']):.4f} "
-        f"miss_rate={float(metrics['miss_rate']):.4f}"
+        f"accuracy={format_metric(metrics['accuracy'])} "
+        f"balanced_accuracy={format_metric(metrics['balanced_accuracy'])} "
+        f"macro_f1={format_metric(metrics['macro_f1'])} "
+        f"roc_auc={format_metric(metrics['roc_auc'])} "
+        f"auprc={format_metric(metrics['auprc'])} "
+        f"sensitivity={format_metric(metrics['sensitivity'])} "
+        f"specificity={format_metric(metrics['specificity'])} "
+        f"miss_rate={format_metric(metrics['miss_rate'])}"
     )
+
+
+def format_metric(value: object) -> str:
+    value = float(value)
+    return "nan" if np.isnan(value) else f"{value:.4f}"
 
 
 def pair_subjects(pairs: list[tuple[Path, Path]]) -> list[int]:
