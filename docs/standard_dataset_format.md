@@ -85,3 +85,27 @@ python -m droweeg.train \
 ```
 
 Current source-only metrics assume binary labels. Future source-free adaptation workflows may use unlabeled target arrays.
+
+## Official Adapters
+
+Official adapters such as `seedvig` and `sadt-balanced` convert known public dataset layouts into this same standard representation:
+
+```python
+sadt = droweeg.dataset("sadt-balanced", path="data/sad-data.mat")
+standard = sadt.to_standard_dataset()
+print(standard.get_metadata())
+```
+
+SEED-VIG can also be converted, but it loads and windows the raw continuous EEG and can be memory-heavy:
+
+```python
+seedvig = droweeg.dataset(
+    "seedvig",
+    raw_data_dir="data/raw/SEED-VIG/Raw_Data",
+    label_dir="data/raw/SEED-VIG/perclos_labels",
+    label_mode="threshold35",
+)
+standard = seedvig.to_standard_dataset()
+```
+
+For large SEED-VIG experiments, the compatibility trainer may still stream through the official adapter path rather than materializing a full `.npz` first. The conceptual interface remains the same: official adapters produce `(X, y, subjects, ...)` before model training.

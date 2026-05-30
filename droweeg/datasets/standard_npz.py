@@ -134,6 +134,9 @@ class StandardDataset(EEGDataset):
             metadata=self._metadata.get("metadata"),
         )
 
+    def to_standard_dataset(self) -> "StandardDataset":
+        return self
+
     def _sync_shape_metadata(self) -> None:
         arrays = self.get_data()
         self.input_channels = int(arrays["x"].shape[1])

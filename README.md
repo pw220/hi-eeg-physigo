@@ -72,7 +72,16 @@ droweeg.save_standard_dataset(
 dataset = droweeg.dataset("standard-npz", path="my_dataset.npz")
 ```
 
-Official adapters such as `seedvig` and `sadt-balanced` exist for selected public datasets and convert their known formats into the same internal standard representation. See `docs/standard_dataset_format.md`.
+Official adapters such as `seedvig` and `sadt-balanced` exist for selected public datasets and convert their known formats into the same internal standard representation:
+
+```python
+standard = droweeg.dataset(
+    "sadt-balanced",
+    path="data/sad-data.mat",
+).to_standard_dataset()
+```
+
+See `docs/standard_dataset_format.md`.
 
 ## Current Working Pipeline
 

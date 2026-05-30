@@ -82,12 +82,13 @@ def run_from_kwargs(**kwargs) -> dict[str, Any]:
     if isinstance(dataset_obj, EEGDataset):
         kwargs = dict(kwargs)
         kwargs["dataset"] = "standard-npz"
-        if isinstance(dataset_obj, StandardDataset) and dataset_obj.path is not None:
-            kwargs["standard_npz_path"] = str(dataset_obj.path)
+        standard_dataset = dataset_obj.to_standard_dataset()
+        if isinstance(standard_dataset, StandardDataset) and standard_dataset.path is not None:
+            kwargs["standard_npz_path"] = str(standard_dataset.path)
             return main(kwargs_to_argv(kwargs))
         with TemporaryDirectory(prefix="droweeg_") as tmpdir:
             path = Path(tmpdir) / "dataset.npz"
-            dataset_obj.save(path)
+            standard_dataset.save(path)
             kwargs["standard_npz_path"] = str(path)
             return main(kwargs_to_argv(kwargs))
     return main(kwargs_to_argv(kwargs))

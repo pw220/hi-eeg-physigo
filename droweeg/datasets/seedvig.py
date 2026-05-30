@@ -3,9 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from data.seedvig_integrity import build_seedvig_integrity_report
-from data.seedvig_dataset import parse_subject_id
+from data.seedvig_dataset import load_seedvig_file_pairs, parse_subject_id, sessions_to_arrays
 
 from .base import EEGDataset
+from .standard_npz import StandardDataset
 
 
 class SeedVIGDataset(EEGDataset):
@@ -65,3 +66,25 @@ class SeedVIGDataset(EEGDataset):
             "sessions": len(self._report.valid_file_pairs),
             "label_rule": self._report.label_rule,
         }
+
+    def to_standard_dataset(self) -> StandardDataset:
+        if self._report is None:
+            self.load()
+        assert self._report is not None
+        sessions = load_seedvig_file_pairs(self._report.valid_file_pairs, label_mode=self.label_mode)
+        arrays = sessions_to_arrays(sessions)
+        return StandardDataset.from_arrays(
+            X=arrays["x"],
+            y=arrays["y"],
+            subjects=arrays["subject_id"],
+            sessions=arrays["session_id"],
+            sample_ids=arrays["sample_id"],
+            sfreq=200,
+            label_names={0: "alert", 1: "fatigue"},
+            metadata={
+                "source_dataset": self.name,
+                "data_root": str(self.data_root),
+                "label_mode": self.label_mode,
+                "description": "Converted from SEED-VIG Raw_Data and PERCLOS labels.",
+            },
+        )

@@ -79,3 +79,6 @@ class EEGDataset:
 
     def build_fold(self, target_subject: int, validation_mode: str = "subject_split", seed: int = 42, **kwargs) -> EEGFold:
         raise NotImplementedError
+
+    def to_standard_dataset(self) -> "EEGDataset":
+        raise NotImplementedError

@@ -7,6 +7,7 @@ import numpy as np
 from data.sadt_dataset import load_sadt_arrays, load_sadt_mat, sadt_counts
 
 from .base import EEGDataset, EEGFold
+from .standard_npz import StandardDataset
 
 
 class SADTBalancedDataset(EEGDataset):
@@ -46,6 +47,23 @@ class SADTBalancedDataset(EEGDataset):
             "counts": sadt_counts(arrays),
             "description": "Processed balanced SADT mini dataset; labels are 0=alert and 1=fatigue/drowsy.",
         }
+
+    def to_standard_dataset(self) -> StandardDataset:
+        arrays = self.get_data()
+        return StandardDataset.from_arrays(
+            X=arrays["x"],
+            y=arrays["y"],
+            subjects=arrays["subject_id"],
+            sessions=arrays["session_id"],
+            sample_ids=arrays["sample_id"],
+            sfreq=128,
+            label_names={0: "alert", 1: "fatigue"},
+            metadata={
+                "source_dataset": self.name,
+                "source_path": str(self.path),
+                "description": "Converted from processed balanced SADT mini dataset.",
+            },
+        )
 
     def build_fold(self, target_subject: int, validation_mode: str = "subject_split", seed: int = 42, **kwargs) -> EEGFold:
         from droweeg.protocols.splits import build_array_loso_fold
