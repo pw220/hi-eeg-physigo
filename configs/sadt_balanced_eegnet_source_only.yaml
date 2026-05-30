@@ -1,0 +1,13 @@
+dataset: sadt-balanced
+model: eegnet
+method: source_only
+protocol: loso
+sadt_balanced_path: data/sad-data.mat
+epochs: 50
+batch_size: 64
+device: cuda
+class_balance: weighted_loss
+loss_type: weighted_ce
+validation_mode: none
+checkpoint_policy: last
+disable_early_stop: true

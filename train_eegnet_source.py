@@ -74,6 +74,7 @@ class FoldPlan:
     validation_mode: str
     checkpoint_policy: str
     validation_strategy: str
+    outputs_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -90,9 +91,10 @@ class DatasetContext:
     sadt_arrays: dict[str, np.ndarray] | None
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Source-only EEGNet LOSO baseline on EEG fatigue datasets")
     parser.add_argument("--dataset", choices=("seedvig", "sadt"), default="seedvig")
+    parser.add_argument("--dataset-display-name", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--model", choices=("eegnet",), default="eegnet")
     parser.add_argument("--data-root", default="data/raw/SEED-VIG")
     parser.add_argument("--raw-data-dir", default=None)
@@ -104,6 +106,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--label-mode", choices=("threshold35", "strict035070"), default="threshold35")
     parser.add_argument("--class-balance", choices=("none", "weighted_loss"), default="weighted_loss")
+    parser.add_argument(
+        "--loss-type",
+        choices=("ce", "weighted_ce", "focal"),
+        default="weighted_ce",
+        help="Loss function. weighted_ce preserves the original weighted CrossEntropyLoss behavior.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -148,6 +156,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eegnet-norm-rate", type=float, default=0.25)
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--outputs-dir", dest="output_dir", help=argparse.SUPPRESS)
+    parser.add_argument("--output-layout", choices=("flat", "droweeg"), default="flat", help=argparse.SUPPRESS)
     parser.add_argument("--save-latest", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -157,11 +166,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-repro", action="store_true")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda", "mps"))
     parser.add_argument("--min-class-samples", type=int, default=1)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     if args.skip_existing and args.overwrite:
         raise ValueError("--skip-existing and --overwrite are mutually exclusive")
     if (args.raw_data_dir is None) != (args.label_dir is None):
@@ -169,7 +178,8 @@ def main() -> None:
     validate_training_args(args)
     set_seed(args.seed, deterministic=args.deterministic)
     outputs_dir = Path(args.output_dir)
-    outputs_dir.mkdir(parents=True, exist_ok=True)
+    if outputs_enabled(args):
+        outputs_dir.mkdir(parents=True, exist_ok=True)
 
     context = build_dataset_context(args, outputs_dir)
     target_subjects = resolve_target_subjects(args, context.subjects)
@@ -195,7 +205,7 @@ def main() -> None:
     repro_metadata = reproducibility_metadata(args, device)
     print_reproducibility_metadata(repro_metadata)
     for plan in plans:
-        if args.skip_existing and fold_outputs_exist(plan):
+        if args.skip_existing and plan.outputs_enabled and fold_outputs_exist(plan):
             print(f"Skipping target_subject={plan.target_subject}: existing prediction CSV and checkpoint found")
             continue
         try:
@@ -203,19 +213,20 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001 - all-LOSO should continue after fold failures
             print(f"Fold target_subject={plan.target_subject} failed: {exc}")
             traceback.print_exc()
-            write_failed_summary_row(plan.summary_path, args, plan, exc)
-            try:
-                write_checkpoint_manifest_row(
-                    plan.manifest_path,
-                    args,
-                    plan,
-                    status="failed",
-                    best_epoch=None,
-                    best_val_metric=None,
-                    error=repr(exc),
-                )
-            except Exception as manifest_exc:  # noqa: BLE001
-                print(f"Could not write failed manifest row for target_subject={plan.target_subject}: {manifest_exc}")
+            if plan.outputs_enabled:
+                write_failed_summary_row(plan.summary_path, args, plan, exc)
+                try:
+                    write_checkpoint_manifest_row(
+                        plan.manifest_path,
+                        args,
+                        plan,
+                        status="failed",
+                        best_epoch=None,
+                        best_val_metric=None,
+                        error=repr(exc),
+                    )
+                except Exception as manifest_exc:  # noqa: BLE001
+                    print(f"Could not write failed manifest row for target_subject={plan.target_subject}: {manifest_exc}")
             if not args.run_all_loso:
                 raise
 
@@ -248,8 +259,9 @@ def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> Datase
                 metadata_only=args.dry_run,
             )
             reports[label_mode] = report
-            if not args.dry_run:
-                save_integrity_csv(report, outputs_dir / f"seedvig_integrity_{label_mode}.csv")
+            if not args.dry_run and outputs_enabled(args):
+                integrity_dir = outputs_dir / "reports" if args.output_layout == "droweeg" else outputs_dir
+                save_integrity_csv(report, integrity_dir / f"seedvig_integrity_{label_mode}.csv")
         report = reports[args.label_mode]
         file_pairs = report.valid_file_pairs
         subjects = sorted({parse_subject_id(raw_path) for raw_path, _ in file_pairs})
@@ -275,7 +287,7 @@ def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> Datase
         print("  label_protocol=rt_binary")
         print("  label_mode_not_applicable=True")
         return DatasetContext(
-            dataset="sadt",
+            dataset=args.dataset_display_name or "sadt",
             model_name=args.model,
             label_protocol="rt_binary",
             input_channels=30,
@@ -327,6 +339,10 @@ def validate_training_args(args: argparse.Namespace) -> None:
         raise ValueError("--test-every-epochs must be non-negative; use 0 for final-only target evaluation")
     if args.dataset == "sadt" and args.bandpass:
         raise ValueError("--bandpass is not supported for SADT because SADT is already preprocessed")
+    if output_dir_is_disabled(args.output_dir) and args.skip_existing:
+        raise ValueError("--skip-existing requires output saving; use an output directory instead of --output-dir none")
+    if args.loss_type == "weighted_ce" and args.class_balance == "none":
+        raise ValueError("--loss-type weighted_ce requires --class-balance weighted_loss")
     if args.eegnet_f1 <= 0 or args.eegnet_d <= 0:
         raise ValueError("--eegnet-f1 and --eegnet-d must be positive")
     if args.eegnet_f2 < 0:
@@ -343,16 +359,28 @@ def validate_training_args(args: argparse.Namespace) -> None:
         raise ValueError("--eegnet-norm-rate must be positive")
 
 
+def output_dir_is_disabled(output_dir: str | None) -> bool:
+    return output_dir is not None and str(output_dir).strip().lower() in {"none", "null", "off", "false"}
+
+
+def outputs_enabled(args: argparse.Namespace) -> bool:
+    return not output_dir_is_disabled(args.output_dir)
+
+
 def make_run_id(args: argparse.Namespace, target_subject: int) -> str:
     base = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     return f"{base}_subject{target_subject}"
 
 
 def fold_outputs_exist(plan: FoldPlan) -> bool:
+    if not plan.outputs_enabled:
+        return False
     return plan.prediction_path.exists() and any(existing_checkpoints_for_plan(plan))
 
 
 def existing_checkpoints_for_plan(plan: FoldPlan) -> list[Path]:
+    if not plan.outputs_enabled:
+        return []
     pattern = f"{plan.dataset}_{plan.model_name}_source_only_*_subject_{plan.target_subject}_seed*.pt"
     return sorted(plan.checkpoint_path.parent.glob(pattern))
 
@@ -463,7 +491,20 @@ def plan_loso_fold(
     checkpoints_dir = outputs_dir / "checkpoints"
     output_stem = f"{context.dataset}_{context.model_name}_source_only_{context.label_protocol}_subject_{target_subject}"
     summary_stem = f"{context.dataset}_{context.model_name}_source_only_{context.label_protocol}"
-    prediction_path = outputs_dir / f"{output_stem}.csv"
+    if args.output_layout == "droweeg":
+        prediction_path = outputs_dir / "predictions" / f"{output_stem}.csv"
+        summary_path = outputs_dir / "summaries" / f"{summary_stem}_summary.csv"
+        fold_report_path = outputs_dir / "reports" / f"loso_fold_integrity_{summary_stem}_subject_{target_subject}.txt"
+        val_metrics_path = outputs_dir / "reports" / f"val_metrics_{summary_stem}_subject_{target_subject}.csv"
+        test_metrics_path = outputs_dir / "reports" / f"test_metrics_history_{summary_stem}_subject_{target_subject}.csv"
+        manifest_path = outputs_dir / "checkpoints" / "checkpoints_manifest.csv"
+    else:
+        prediction_path = outputs_dir / f"{output_stem}.csv"
+        summary_path = outputs_dir / f"{summary_stem}_summary.csv"
+        fold_report_path = outputs_dir / f"loso_fold_integrity_{summary_stem}_subject_{target_subject}.txt"
+        val_metrics_path = outputs_dir / f"val_metrics_{summary_stem}_subject_{target_subject}.csv"
+        test_metrics_path = outputs_dir / f"test_metrics_history_{summary_stem}_subject_{target_subject}.csv"
+        manifest_path = outputs_dir / "checkpoints_manifest.csv"
     checkpoint_path = checkpoints_dir / (
         f"{output_stem}_seed{args.seed}_{run_id}.pt"
     )
@@ -472,11 +513,6 @@ def plan_loso_fold(
         if args.save_latest
         else None
     )
-    summary_path = outputs_dir / f"{summary_stem}_summary.csv"
-    fold_report_path = outputs_dir / f"loso_fold_integrity_{summary_stem}_subject_{target_subject}.txt"
-    val_metrics_path = outputs_dir / f"val_metrics_{summary_stem}_subject_{target_subject}.csv"
-    test_metrics_path = outputs_dir / f"test_metrics_history_{summary_stem}_subject_{target_subject}.csv"
-    manifest_path = outputs_dir / "checkpoints_manifest.csv"
     command = (
         "python train_eegnet_source.py "
         f"--dataset {args.dataset} "
@@ -503,6 +539,7 @@ def plan_loso_fold(
         f"--device {args.device} "
         f"--label-mode {args.label_mode} "
         f"--class-balance {args.class_balance} "
+        f"--loss-type {args.loss_type} "
         f"--eegnet-f1 {args.eegnet_f1} "
         f"--eegnet-d {args.eegnet_d} "
         f"--eegnet-f2 {args.eegnet_f2} "
@@ -562,6 +599,7 @@ def plan_loso_fold(
         validation_mode=args.validation_mode,
         checkpoint_policy=args.checkpoint_policy,
         validation_strategy=validation_strategy,
+        outputs_enabled=outputs_enabled(args),
     )
 
 
@@ -644,7 +682,7 @@ def run_loso_fold(
     model = build_model(args.model, context.input_channels, context.input_samples, context.num_classes, args).to(device)
     optimizer = make_optimizer(model, args)
     scheduler = make_scheduler(optimizer, args)
-    criterion = nn.CrossEntropyLoss(weight=criterion_weight)
+    criterion = make_criterion(args, criterion_weight)
     initial_checksum = model_parameter_checksum(model)
     if args.debug_repro:
         print(f"debug_repro initial_parameter_checksum={initial_checksum}")
@@ -761,7 +799,7 @@ def run_loso_fold(
     if best_target_diagnostic_metrics is not None:
         print_best_target_diagnostic_metrics(best_target_diagnostic_epoch, best_target_diagnostic_metrics)
     model.load_state_dict(selected_state)
-    if val is not None:
+    if val is not None and plan.outputs_enabled:
         save_validation_subject_metrics(
             model,
             val,
@@ -780,9 +818,11 @@ def run_loso_fold(
     has_validation = val_loader is not None
     if test_metrics_history:
         test_metrics_history.append(metrics_history_row(selected_epoch, test_metrics, reason="final_selected_checkpoint"))
-        save_test_metrics_history(plan.test_metrics_path, test_metrics_history)
+        if plan.outputs_enabled:
+            save_test_metrics_history(plan.test_metrics_path, test_metrics_history)
 
-    save_predictions(plan.prediction_path, test, test_y, test_pred, test_probs, plan)
+    if plan.outputs_enabled:
+        save_predictions(plan.prediction_path, test, test_y, test_pred, test_probs, plan)
     checkpoint = {
         "run_id": plan.run_id,
         "created_at": plan.created_at,
@@ -802,6 +842,7 @@ def run_loso_fold(
         "target_subject": plan.target_subject,
         "seed": args.seed,
         "class_balance": args.class_balance,
+        "loss_type": args.loss_type,
         "train_subject_ids": plan.train_subject_ids,
         "val_subject_ids": plan.val_subject_ids,
         "normalization_mean": torch.from_numpy(preprocess_state["mean"].copy()),
@@ -829,45 +870,50 @@ def run_loso_fold(
         },
         "final_metrics": serializable_metrics(test_metrics),
     }
-    plan.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(checkpoint, plan.checkpoint_path)
-    if plan.latest_checkpoint_path is not None:
-        plan.latest_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(checkpoint, plan.latest_checkpoint_path)
-    save_success_summary_row(
-        plan.summary_path,
-        args=args,
-        plan=plan,
-        metrics=test_metrics,
-        class_weights=class_weights,
-        best_epoch=None if val_loader is None else best_epoch,
-        best_macro_f1=np.nan if val_loader is None else best_macro_f1,
-        best_balanced_acc=np.nan if val_loader is None else best_balanced_acc,
-        best_monitor=np.nan if val_loader is None else best_monitor,
-        selected_epoch=selected_epoch,
-        selected_reason=selected_reason,
-    )
-    write_checkpoint_manifest_row(
-        plan.manifest_path,
-        args,
-        plan,
-        status="success",
-        best_epoch=selected_epoch,
-        best_val_metric=best_monitor,
-        error="",
-    )
-    print(f"Saved predictions: {plan.prediction_path}")
-    print(f"Saved checkpoint: {plan.checkpoint_path}")
-    if plan.latest_checkpoint_path is not None:
-        print(f"Saved latest checkpoint: {plan.latest_checkpoint_path}")
-    print(f"Saved summary: {plan.summary_path}")
-    if val is not None:
-        print(f"Saved validation metrics: {plan.val_metrics_path}")
-    if test_metrics_history:
-        print(f"Saved target diagnostic metrics: {plan.test_metrics_path}")
+    if plan.outputs_enabled:
+        plan.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(checkpoint, plan.checkpoint_path)
+        if plan.latest_checkpoint_path is not None:
+            plan.latest_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(checkpoint, plan.latest_checkpoint_path)
+        save_success_summary_row(
+            plan.summary_path,
+            args=args,
+            plan=plan,
+            metrics=test_metrics,
+            class_weights=class_weights,
+            best_epoch=None if val_loader is None else best_epoch,
+            best_macro_f1=np.nan if val_loader is None else best_macro_f1,
+            best_balanced_acc=np.nan if val_loader is None else best_balanced_acc,
+            best_monitor=np.nan if val_loader is None else best_monitor,
+            selected_epoch=selected_epoch,
+            selected_reason=selected_reason,
+        )
+        write_checkpoint_manifest_row(
+            plan.manifest_path,
+            args,
+            plan,
+            status="success",
+            best_epoch=selected_epoch,
+            best_val_metric=best_monitor,
+            error="",
+        )
+        print(f"Saved predictions: {plan.prediction_path}")
+        print(f"Saved checkpoint: {plan.checkpoint_path}")
+        if plan.latest_checkpoint_path is not None:
+            print(f"Saved latest checkpoint: {plan.latest_checkpoint_path}")
+        print(f"Saved summary: {plan.summary_path}")
+        if val is not None:
+            print(f"Saved validation metrics: {plan.val_metrics_path}")
+        if test_metrics_history:
+            print(f"Saved target diagnostic metrics: {plan.test_metrics_path}")
+    else:
+        print("Output saving disabled: --output-dir none")
 
 
 def write_fold_report(args: argparse.Namespace, context: DatasetContext, plan: FoldPlan) -> None:
+    if not plan.outputs_enabled:
+        return
     if context.dataset == "seedvig":
         if context.integrity_report is None:
             raise ValueError("SEED-VIG fold report requires an integrity report")
@@ -940,7 +986,7 @@ def print_dataset_fold_summary(args: argparse.Namespace, context: DatasetContext
     print(f"  input_samples={context.input_samples}")
     print(f"  num_classes={context.num_classes}")
     print(f"  label_protocol={context.label_protocol}")
-    if context.dataset == "sadt":
+    if context.dataset != "seedvig":
         print(f"  label_mode={args.label_mode} ignored_for_sadt=True")
     print(f"  normalization_stats=source_training_only")
 
@@ -1227,6 +1273,7 @@ def eegnet_model_config(args: argparse.Namespace, context: DatasetContext) -> di
 def training_config(args: argparse.Namespace) -> dict[str, object]:
     return {
         "optimizer": args.optimizer,
+        "loss_type": args.loss_type,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "momentum": args.momentum,
@@ -1311,6 +1358,28 @@ def print_class_balance(y: np.ndarray, class_balance: str, class_weights: np.nda
         print("  class_weights=None")
     else:
         print(f"  class_weights={{0: {class_weights[0]:.6f}, 1: {class_weights[1]:.6f}}}")
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, *, weight: torch.Tensor | None = None, gamma: float = 2.0) -> None:
+        super().__init__()
+        self.weight = weight
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        ce = nn.functional.cross_entropy(logits, target, weight=self.weight, reduction="none")
+        pt = torch.exp(-ce)
+        return (((1.0 - pt) ** self.gamma) * ce).mean()
+
+
+def make_criterion(args: argparse.Namespace, criterion_weight: torch.Tensor | None) -> nn.Module:
+    if args.loss_type == "ce":
+        return nn.CrossEntropyLoss()
+    if args.loss_type == "weighted_ce":
+        return nn.CrossEntropyLoss(weight=criterion_weight)
+    if args.loss_type == "focal":
+        return FocalLoss(weight=criterion_weight)
+    raise ValueError(f"Unsupported loss type: {args.loss_type}")
 
 
 def train_one_epoch(
@@ -1487,6 +1556,8 @@ def save_predictions(path: Path, arrays: dict[str, np.ndarray], y_true, y_pred, 
 
 
 def guard_run_outputs(args: argparse.Namespace, plan: FoldPlan) -> None:
+    if not plan.outputs_enabled:
+        return
     if plan.checkpoint_path.exists() and not args.overwrite:
         raise FileExistsError(f"Checkpoint already exists: {plan.checkpoint_path}. Use --overwrite to replace it.")
     if manifest_has_run_id(plan.manifest_path, plan.run_id) and not args.overwrite:
@@ -1624,6 +1695,7 @@ def write_checkpoint_manifest_row(
         "target_subject": plan.target_subject,
         "seed": args.seed,
         "class_balance": args.class_balance,
+        "loss_type": args.loss_type,
         "epochs": args.epochs,
         "deterministic": args.deterministic,
         "num_workers": args.num_workers,
@@ -1743,6 +1815,7 @@ def base_summary_fields(args: argparse.Namespace, plan: FoldPlan) -> dict[str, o
         "label_mode": args.label_mode,
         "seed": args.seed,
         "class_balance": args.class_balance,
+        "loss_type": args.loss_type,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "lr": args.lr,
@@ -1839,9 +1912,10 @@ def print_global_plan_header(args: argparse.Namespace, context: DatasetContext, 
     print(f"  num_classes={context.num_classes}")
     print(f"  label_protocol={context.label_protocol}")
     print(f"  label_mode={args.label_mode}")
-    if context.dataset == "sadt":
+    if context.dataset != "seedvig":
         print("  label_mode_applicable=False")
     print(f"  class_balance={args.class_balance}")
+    print(f"  loss_type={args.loss_type}")
     print(f"  optimizer={args.optimizer}")
     print(f"  lr={args.lr}")
     print(f"  weight_decay={args.weight_decay}")
@@ -1866,6 +1940,7 @@ def print_global_plan_header(args: argparse.Namespace, context: DatasetContext, 
     print(f"  raw_data_dir={args.raw_data_dir}")
     print(f"  label_dir={args.label_dir}")
     print(f"  output_dir={args.output_dir}")
+    print(f"  outputs_enabled={outputs_enabled(args)}")
     print(f"  run_all_loso={args.run_all_loso}")
     print(f"  max_folds={args.max_folds}")
     print(f"  dry_run={args.dry_run}")
@@ -1900,15 +1975,26 @@ def print_fold_plan(plan: FoldPlan, *, dry_run: bool) -> None:
             f"  {name}: sessions={counts['sessions']} usable={counts['usable']} "
             f"alert={counts['alert']} fatigue={counts['fatigue']} excluded={counts['excluded']}"
         )
-    print(f"  predictions={plan.prediction_path}")
-    print(f"  checkpoint={plan.checkpoint_path}")
-    if plan.latest_checkpoint_path is not None:
+    if plan.outputs_enabled:
+        print(f"  predictions={plan.prediction_path}")
+        print(f"  checkpoint={plan.checkpoint_path}")
+    else:
+        print("  predictions=disabled")
+        print("  checkpoint=disabled")
+    if plan.latest_checkpoint_path is not None and plan.outputs_enabled:
         print(f"  latest_checkpoint={plan.latest_checkpoint_path}")
-    print(f"  summary={plan.summary_path}")
-    print(f"  fold_report={plan.fold_report_path}")
-    print(f"  val_metrics={plan.val_metrics_path}")
-    print(f"  test_metrics_history={plan.test_metrics_path}")
-    print(f"  manifest={plan.manifest_path}")
+    if plan.outputs_enabled:
+        print(f"  summary={plan.summary_path}")
+        print(f"  fold_report={plan.fold_report_path}")
+        print(f"  val_metrics={plan.val_metrics_path}")
+        print(f"  test_metrics_history={plan.test_metrics_path}")
+        print(f"  manifest={plan.manifest_path}")
+    else:
+        print("  summary=disabled")
+        print("  fold_report=disabled")
+        print("  val_metrics=disabled")
+        print("  test_metrics_history=disabled")
+        print("  manifest=disabled")
     print(f"  run_id={plan.run_id}")
     print(f"  single_fold_command={plan.single_fold_command}")
     if dry_run:

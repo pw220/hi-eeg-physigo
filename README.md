@@ -1,8 +1,42 @@
-# SEED-VIG EEGNet Source-Only Baseline
+# DrowEEG
 
-This repository contains a minimal, reproducible EEGNet source-only LOSO baseline for SEED-VIG raw EEG driver fatigue detection.
+DrowEEG is a lightweight research package for EEG-based drowsiness recognition. The current stable method is an EEGNet source-only LOSO baseline for SEED-VIG raw EEG and the processed balanced SADT mini dataset.
 
 No TRACE, SFDA, Riemannian reference, pseudo-labeling, entropy minimization, or adaptation method is implemented in the current baseline.
+
+## Package API
+
+The recommended new interface is:
+
+```python
+import droweeg
+
+print(droweeg.list_datasets())
+print(droweeg.list_models())
+print(droweeg.list_methods())
+
+model = droweeg.model("eegnet", channels=17, samples=1600, num_classes=2)
+dataset = droweeg.dataset("sadt-balanced", path="data/sad-data.mat")
+
+results = droweeg.run(
+    dataset="sadt-balanced",
+    model="eegnet",
+    method="source_only",
+    protocol="loso",
+    sadt_balanced_path="data/sad-data.mat",
+    run_all_loso=True,
+    epochs=50,
+    device="cuda",
+)
+```
+
+Current registries:
+
+- datasets: `seedvig`, `sadt-balanced`
+- models: `eegnet`
+- methods: `source_only`
+
+Advanced users can register custom components with `droweeg.register_model(...)`, `droweeg.register_dataset(...)`, and `droweeg.register_method(...)`. See `docs/custom_model.md`.
 
 ## Current Working Pipeline
 
@@ -15,6 +49,7 @@ No TRACE, SFDA, Riemannian reference, pseudo-labeling, entropy minimization, or 
 
 Active files:
 
+- `python -m droweeg.train`
 - `train_eegnet_source.py`
 - `data/seedvig_dataset.py`
 - `data/seedvig_integrity.py`
@@ -41,7 +76,7 @@ Colab / Google Drive example:
 /content/drive/MyDrive/SEED-VIG/perclos_labels
 ```
 
-SADT is a processed `.mat` file and should also stay out of Git. The default local path is:
+SADT-balanced is a processed balanced `.mat` mini dataset and should also stay out of Git. This is not the raw/continuous SADT `.set` dataset. The default local path is:
 
 ```text
 data/sad-data.mat
@@ -68,14 +103,16 @@ python train_eegnet_source.py --target-subject 1 --epochs 1 --batch-size 64 --de
 
 ## Running Different Datasets And Models
 
-For now, `eegnet` is the only supported model. Dataset selection is controlled by `--dataset`.
+For now, `eegnet` is the only supported model and `source_only` is the only supported method. New DrowEEG commands use `python -m droweeg.train`.
 
 SEED-VIG example:
 
 ```bash
-python train_eegnet_source.py \
+python -m droweeg.train \
   --dataset seedvig \
   --model eegnet \
+  --method source_only \
+  --protocol loso \
   --target-subject 1 \
   --epochs 2 \
   --batch-size 64 \
@@ -84,13 +121,15 @@ python train_eegnet_source.py \
   --class-balance weighted_loss
 ```
 
-SADT example:
+SADT-balanced example:
 
 ```bash
-python train_eegnet_source.py \
-  --dataset sadt \
+python -m droweeg.train \
+  --dataset sadt-balanced \
   --model eegnet \
-  --sadt-path data/sad-data.mat \
+  --method source_only \
+  --protocol loso \
+  --sadt-balanced-path data/sad-data.mat \
   --target-subject 1 \
   --epochs 2 \
   --batch-size 64 \
@@ -99,20 +138,37 @@ python train_eegnet_source.py \
   --class-balance weighted_loss
 ```
 
-SADT full LOSO GPU example:
+SADT-balanced full LOSO GPU example:
 
 ```bash
-python train_eegnet_source.py \
-  --dataset sadt \
+python -m droweeg.train \
+  --dataset sadt-balanced \
   --model eegnet \
-  --sadt-path data/sad-data.mat \
+  --method source_only \
+  --protocol loso \
+  --sadt-balanced-path data/sad-data.mat \
   --run-all-loso \
   --epochs 50 \
   --batch-size 64 \
   --device cuda \
-  --validation-mode sample_stratified \
+  --validation-mode none \
+  --checkpoint-policy last \
   --class-balance weighted_loss
 ```
+
+Dry run:
+
+```bash
+python -m droweeg.train \
+  --dataset sadt-balanced \
+  --model eegnet \
+  --method source_only \
+  --protocol loso \
+  --run-all-loso \
+  --dry-run
+```
+
+The old `train_eegnet_source.py` commands remain available for backward compatibility.
 
 Configurable one-fold training example. The backbone remains the faithful ARL EEGNet-8,2 port; pooling is fixed at `(1, 4)` then `(1, 8)` to match the original architecture.
 

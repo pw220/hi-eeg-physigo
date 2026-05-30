@@ -1,0 +1,13 @@
+dataset: seedvig
+model: eegnet
+method: source_only
+protocol: loso
+label_mode: threshold35
+epochs: 50
+batch_size: 64
+device: cuda
+class_balance: weighted_loss
+loss_type: weighted_ce
+validation_mode: subject_split
+checkpoint_policy: best_val
+monitor_metric: macro_f1
