@@ -36,6 +36,7 @@ from data.seedvig_dataset import (
     sessions_to_arrays,
 )
 from data.sadt_dataset import load_sadt_arrays, sadt_counts
+from droweeg.datasets.standard_npz import load_standard_dataset, standard_counts
 from models.factory import build_model
 from utils.metrics import classification_metrics, entropy_from_probs, softmax
 from utils.seed import set_seed
@@ -93,13 +94,14 @@ class DatasetContext:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Source-only EEGNet LOSO baseline on EEG fatigue datasets")
-    parser.add_argument("--dataset", choices=("seedvig", "sadt"), default="seedvig")
+    parser.add_argument("--dataset", choices=("seedvig", "sadt", "standard-npz"), default="seedvig")
     parser.add_argument("--dataset-display-name", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--model", choices=("eegnet",), default="eegnet")
     parser.add_argument("--data-root", default="data/raw/SEED-VIG")
     parser.add_argument("--raw-data-dir", default=None)
     parser.add_argument("--label-dir", default=None)
     parser.add_argument("--sadt-path", default="data/sad-data.mat")
+    parser.add_argument("--standard-npz-path", default=None)
     parser.add_argument("--target-subject", type=int, default=1)
     parser.add_argument("--run-all-loso", action="store_true")
     parser.add_argument("--max-folds", type=int, default=None)
@@ -298,6 +300,31 @@ def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> Datase
             file_pairs=[],
             sadt_arrays=arrays,
         )
+    if args.dataset == "standard-npz":
+        arrays, metadata = load_standard_dataset(args.standard_npz_path)
+        if "y" not in arrays:
+            raise ValueError("standard-npz source-only training requires y labels")
+        labels = set(np.unique(arrays["y"]).astype(int).tolist())
+        if not labels.issubset({0, 1}):
+            raise ValueError(f"standard-npz source-only metrics currently require binary labels {{0, 1}}, got {sorted(labels)}")
+        subjects = sorted({int(subject) for subject in arrays["subject_id"]})
+        print("standard_npz_dataset_summary")
+        print(f"  path={args.standard_npz_path}")
+        print(f"  samples={len(arrays['y'])}")
+        print(f"  subjects={subjects}")
+        print("  label_protocol=standard")
+        return DatasetContext(
+            dataset=args.dataset_display_name or "standard-npz",
+            model_name=args.model,
+            label_protocol="standard",
+            input_channels=int(arrays["x"].shape[1]),
+            input_samples=int(arrays["x"].shape[2]),
+            num_classes=int(max(labels)) + 1,
+            subjects=subjects,
+            integrity_report=None,
+            file_pairs=[],
+            sadt_arrays=arrays,
+        )
     raise ValueError(f"Unsupported dataset: {args.dataset}")
 
 
@@ -337,8 +364,10 @@ def validate_training_args(args: argparse.Namespace) -> None:
         print("warning: validation-mode=none disables early stopping because no validation metrics are computed")
     if args.test_every_epochs < 0:
         raise ValueError("--test-every-epochs must be non-negative; use 0 for final-only target evaluation")
-    if args.dataset == "sadt" and args.bandpass:
-        raise ValueError("--bandpass is not supported for SADT because SADT is already preprocessed")
+    if args.dataset in {"sadt", "standard-npz"} and args.bandpass:
+        raise ValueError("--bandpass is not supported for pre-windowed array datasets")
+    if args.dataset == "standard-npz" and args.standard_npz_path is None:
+        raise ValueError("--dataset standard-npz requires --standard-npz-path")
     if output_dir_is_disabled(args.output_dir) and args.skip_existing:
         raise ValueError("--skip-existing requires output saving; use an output directory instead of --output-dir none")
     if args.loss_type == "weighted_ce" and args.class_balance == "none":
@@ -439,22 +468,28 @@ def plan_array_splits(args: argparse.Namespace, context: DatasetContext, target_
         train_subject_ids, val_subject_ids = split_subject_ids(source_subjects, args.val_subject_ratio, args.seed)
         train = subset_by_subject_ids(source, train_subject_ids)
         val = subset_by_subject_ids(source, val_subject_ids)
-        train_counts = sadt_counts(train)
-        val_counts = sadt_counts(val)
+        train_counts = array_counts(train, context)
+        val_counts = array_counts(val, context)
     elif args.validation_mode == "sample_stratified":
         train, val = split_arrays_stratified(source, val_ratio=args.val_ratio, seed=args.seed)
         train_subject_ids = source_subjects
         val_subject_ids = source_subjects
-        train_counts = sadt_counts(train)
-        val_counts = sadt_counts(val)
+        train_counts = array_counts(train, context)
+        val_counts = array_counts(val, context)
     elif args.validation_mode == "none":
         train_subject_ids = source_subjects
         val_subject_ids = []
-        train_counts = sadt_counts(source)
+        train_counts = array_counts(source, context)
         val_counts = zero_counts()
     else:
         raise ValueError(f"Unsupported validation mode: {args.validation_mode}")
-    return train_counts, val_counts, sadt_counts(test), train_subject_ids, val_subject_ids
+    return train_counts, val_counts, array_counts(test, context), train_subject_ids, val_subject_ids
+
+
+def array_counts(arrays: dict[str, np.ndarray], context: DatasetContext) -> dict[str, int]:
+    if context.label_protocol == "rt_binary":
+        return sadt_counts(arrays)
+    return standard_counts(arrays)
 
 
 def validation_strategy_text(validation_mode: str) -> str:
@@ -556,6 +591,8 @@ def plan_loso_fold(
         command += f" --label-dir {shlex.quote(str(args.label_dir))}"
     if args.dataset == "sadt":
         command += f" --sadt-path {shlex.quote(str(args.sadt_path))}"
+    if args.dataset == "standard-npz":
+        command += f" --standard-npz-path {shlex.quote(str(args.standard_npz_path))}"
     if args.bandpass:
         command += " --bandpass"
     if args.robust_clip:
@@ -1949,9 +1986,12 @@ def print_global_plan_header(args: argparse.Namespace, context: DatasetContext, 
     if context.integrity_report is not None:
         print(f"  included_session_count={len(context.integrity_report.valid_file_pairs)}")
         print(f"  label_rule={context.integrity_report.label_rule}")
-    else:
+    elif context.label_protocol == "rt_binary":
         print(f"  included_session_count={len(context.subjects)}")
         print("  label_rule=rt_binary: 0 alert, 1 fatigue/drowsy")
+    else:
+        print(f"  included_session_count={len(context.subjects)}")
+        print("  label_rule=standard: integer class IDs, binary source-only metrics expect 0 alert and 1 fatigue")
 
 
 def print_fold_plan(plan: FoldPlan, *, dry_run: bool) -> None:
@@ -2187,6 +2227,13 @@ def stratified_metadata_counts(source_counts: dict[str, int], val_ratio: float) 
 
 def print_recommended_gpu_command(args: argparse.Namespace) -> None:
     print("recommended_later_gpu_command")
+    if args.dataset == "standard-npz":
+        print(
+            "python -m droweeg.train --dataset standard-npz --standard-npz-path my_dataset.npz "
+            "--model eegnet --method source_only --protocol loso --run-all-loso --epochs 50 "
+            "--batch-size 64 --device cuda --validation-mode none --checkpoint-policy last"
+        )
+        return
     if args.dataset == "sadt":
         print(
             "python train_eegnet_source.py --dataset sadt --model eegnet "

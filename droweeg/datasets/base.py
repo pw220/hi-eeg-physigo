@@ -31,6 +31,34 @@ class EEGDataset:
     input_samples: int
     num_classes: int = 2
 
+    @classmethod
+    def from_arrays(
+        cls,
+        *,
+        X: np.ndarray,
+        y: np.ndarray | None = None,
+        subjects: np.ndarray,
+        sessions: np.ndarray | None = None,
+        sample_ids: np.ndarray | None = None,
+        sfreq: float | None = None,
+        channel_names: list[str] | None = None,
+        label_names: dict[int, str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> "EEGDataset":
+        from droweeg.datasets.standard_npz import StandardDataset
+
+        return StandardDataset.from_arrays(
+            X=X,
+            y=y,
+            subjects=subjects,
+            sessions=sessions,
+            sample_ids=sample_ids,
+            sfreq=sfreq,
+            channel_names=channel_names,
+            label_names=label_names,
+            metadata=metadata,
+        )
+
     def load(self) -> "EEGDataset":
         raise NotImplementedError
 

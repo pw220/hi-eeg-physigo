@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from droweeg.config import kwargs_to_argv, load_config
+from droweeg.datasets.base import EEGDataset
+from droweeg.datasets.standard_npz import StandardDataset
 from droweeg.engine import run_backend
 
 
@@ -16,7 +19,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description="DrowEEG training CLI")
     parser.add_argument("--config", default=None)
-    parser.add_argument("--dataset", choices=("seedvig", "sadt-balanced"), default="seedvig")
+    parser.add_argument("--dataset", choices=("seedvig", "sadt-balanced", "standard-npz"), default="seedvig")
     parser.add_argument("--model", choices=("eegnet",), default="eegnet")
     parser.add_argument("--method", choices=("source_only",), default="source_only")
     parser.add_argument("--protocol", choices=("loso",), default="loso")
@@ -27,6 +30,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--raw-data-dir", default=None)
     parser.add_argument("--label-dir", default=None)
     parser.add_argument("--sadt-balanced-path", default="data/sad-data.mat")
+    parser.add_argument("--standard-npz-path", default=None)
     parser.add_argument("--label-mode", choices=("threshold35", "strict035070"), default="threshold35")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -74,13 +78,30 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
 
 
 def run_from_kwargs(**kwargs) -> dict[str, Any]:
+    dataset_obj = kwargs.get("dataset")
+    if isinstance(dataset_obj, EEGDataset):
+        kwargs = dict(kwargs)
+        kwargs["dataset"] = "standard-npz"
+        if isinstance(dataset_obj, StandardDataset) and dataset_obj.path is not None:
+            kwargs["standard_npz_path"] = str(dataset_obj.path)
+            return main(kwargs_to_argv(kwargs))
+        with TemporaryDirectory(prefix="droweeg_") as tmpdir:
+            path = Path(tmpdir) / "dataset.npz"
+            dataset_obj.save(path)
+            kwargs["standard_npz_path"] = str(path)
+            return main(kwargs_to_argv(kwargs))
     return main(kwargs_to_argv(kwargs))
 
 
 def to_backend_argv(args: argparse.Namespace) -> list[str]:
-    label_protocol = args.label_mode if args.dataset == "seedvig" else "rt_binary"
+    if args.dataset == "seedvig":
+        label_protocol = args.label_mode
+    elif args.dataset == "sadt-balanced":
+        label_protocol = "rt_binary"
+    else:
+        label_protocol = "standard"
     output_dir = _resolve_output_dir(args.output_dir, args.dataset, args.model, args.method, label_protocol)
-    backend_dataset = "seedvig" if args.dataset == "seedvig" else "sadt"
+    backend_dataset = {"seedvig": "seedvig", "sadt-balanced": "sadt", "standard-npz": "standard-npz"}[args.dataset]
     argv = [
         "--dataset",
         backend_dataset,
@@ -147,9 +168,14 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
             argv.extend(["--raw-data-dir", str(args.raw_data_dir)])
         if args.label_dir is not None:
             argv.extend(["--label-dir", str(args.label_dir)])
-    else:
+    elif args.dataset == "sadt-balanced":
         argv.extend(["--sadt-path", str(args.sadt_balanced_path)])
         argv.extend(["--dataset-display-name", "sadt-balanced"])
+    else:
+        if args.standard_npz_path is None:
+            raise ValueError("--dataset standard-npz requires --standard-npz-path")
+        argv.extend(["--standard-npz-path", str(args.standard_npz_path)])
+        argv.extend(["--dataset-display-name", "standard-npz"])
     if args.run_all_loso:
         argv.append("--run-all-loso")
     if args.max_folds is not None:

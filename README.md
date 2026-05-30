@@ -32,11 +32,47 @@ results = droweeg.run(
 
 Current registries:
 
-- datasets: `seedvig`, `sadt-balanced`
+- datasets: `seedvig`, `sadt-balanced`, `standard-npz`
 - models: `eegnet`
 - methods: `source_only`
 
 Advanced users can register custom components with `droweeg.register_model(...)`, `droweeg.register_dataset(...)`, and `droweeg.register_method(...)`. See `docs/custom_model.md`.
+
+## Raw Data vs DrowEEG Standard Format
+
+DrowEEG does not aim to parse every raw EEG format. Different labs store the same EEG dataset in different raw layouts, so general raw-format support would make the package unstable.
+
+The recommended custom-data route is:
+
+1. Preprocess your EEG into windowed arrays.
+2. Store samples as `X` with shape `(N, C, T)`.
+3. Provide labels `y` and subject IDs `subjects`.
+4. Use `Dataset.from_arrays(...)` or save a reusable `standard-npz` file.
+
+Example:
+
+```python
+dataset = droweeg.Dataset.from_arrays(
+    X=X,
+    y=y,
+    subjects=subjects,
+    sfreq=128,
+    label_names={0: "alert", 1: "fatigue"},
+)
+
+droweeg.save_standard_dataset(
+    "my_dataset.npz",
+    X=X,
+    y=y,
+    subjects=subjects,
+    sfreq=128,
+    label_names={0: "alert", 1: "fatigue"},
+)
+
+dataset = droweeg.dataset("standard-npz", path="my_dataset.npz")
+```
+
+Official adapters such as `seedvig` and `sadt-balanced` exist for selected public datasets and convert their known formats into the same internal standard representation. See `docs/standard_dataset_format.md`.
 
 ## Current Working Pipeline
 
