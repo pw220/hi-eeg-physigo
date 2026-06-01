@@ -4,6 +4,11 @@ DrowEEG is a lightweight research package for EEG-based drowsiness recognition. 
 
 No TRACE, SFDA, Riemannian reference, pseudo-labeling, entropy minimization, or adaptation method is implemented in the current baseline.
 
+The method boundary already reserves an `adaptation_protocol` argument for
+future SFDA work. Current source-only runs use `adaptation_protocol="none"`.
+Future transductive SFDA will mean adapting on a target subject's unlabeled EEG
+and revealing target labels only inside final evaluation metrics.
+
 ## Package API
 
 The recommended interface is path-based: users preprocess data once into a
