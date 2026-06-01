@@ -38,10 +38,12 @@ class StandardDataset(EEGDataset):
         subjects: np.ndarray,
         sessions: np.ndarray | None = None,
         sample_ids: np.ndarray | None = None,
+        perclos: np.ndarray | None = None,
         sfreq: float | None = None,
         channel_names: list[str] | None = None,
         label_names: dict[int, str] | None = None,
         metadata: dict[str, Any] | None = None,
+        extra_arrays: dict[str, np.ndarray] | None = None,
     ) -> "StandardDataset":
         dataset = cls()
         dataset._arrays, dataset._metadata = standardize_arrays(
@@ -50,10 +52,12 @@ class StandardDataset(EEGDataset):
             subjects=subjects,
             sessions=sessions,
             sample_ids=sample_ids,
+            perclos=perclos,
             sfreq=sfreq,
             channel_names=channel_names,
             label_names=label_names,
             metadata=metadata,
+            extra_arrays=extra_arrays,
         )
         dataset._sync_shape_metadata()
         return dataset
@@ -77,17 +81,42 @@ class StandardDataset(EEGDataset):
         assert self._arrays is not None
         return self._arrays
 
+    @property
+    def X(self) -> np.ndarray:
+        return self.get_data()["x"]
+
+    @property
+    def y(self) -> np.ndarray:
+        arrays = self.get_data()
+        if "y" not in arrays:
+            raise AttributeError("This standard-npz dataset has no y labels")
+        return arrays["y"]
+
+    @property
+    def subjects(self) -> np.ndarray:
+        return self.get_data()["subject_id"]
+
     def get_metadata(self) -> dict[str, Any]:
         arrays = self.get_data()
+        metadata = self._metadata.get("metadata", {})
+        label_distribution = {}
+        if "y" in arrays and arrays["y"] is not None:
+            values, counts = np.unique(arrays["y"], return_counts=True)
+            label_distribution = {int(value): int(count) for value, count in zip(values, counts)}
         return {
             **super().get_metadata(),
+            "dataset_name": metadata.get("dataset_name", self.name),
+            "protocol_name": metadata.get("protocol_name"),
+            "label_mode": metadata.get("label_mode"),
             "path": None if self.path is None else str(self.path),
             "samples": int(len(arrays["x"])),
             "subjects": self.get_subjects(),
+            "sessions": sorted(str(session) for session in set(arrays["session_id"].tolist())),
+            "label_distribution": label_distribution,
             "sfreq": self._metadata.get("sfreq"),
             "channel_names": self._metadata.get("channel_names"),
             "label_names": self._metadata.get("label_names"),
-            "metadata": self._metadata.get("metadata", {}),
+            "metadata": metadata,
         }
 
     def build_fold(self, target_subject: int, validation_mode: str = "subject_split", seed: int = 42, **kwargs) -> EEGFold:
@@ -128,10 +157,12 @@ class StandardDataset(EEGDataset):
             subjects=arrays["subject_id"],
             sessions=arrays.get("session_id"),
             sample_ids=arrays.get("sample_id"),
+            perclos=arrays.get("perclos_value"),
             sfreq=self._metadata.get("sfreq"),
             channel_names=self._metadata.get("channel_names"),
             label_names=self._metadata.get("label_names"),
             metadata=self._metadata.get("metadata"),
+            extra_arrays=standard_extra_arrays(arrays),
         )
 
     def to_standard_dataset(self) -> "StandardDataset":
@@ -153,10 +184,12 @@ def standardize_arrays(
     subjects: np.ndarray,
     sessions: np.ndarray | None = None,
     sample_ids: np.ndarray | None = None,
+    perclos: np.ndarray | None = None,
     sfreq: float | None = None,
     channel_names: list[str] | None = None,
     label_names: dict[int, str] | None = None,
     metadata: dict[str, Any] | None = None,
+    extra_arrays: dict[str, np.ndarray] | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     X = np.asarray(X)
     if X.ndim != 3:
@@ -183,6 +216,11 @@ def standardize_arrays(
         if sample_ids is None
         else _as_1d(sample_ids, "sample_ids", n_samples).astype(object)
     )
+    perclos_value = (
+        np.full(n_samples, np.nan, dtype=np.float32)
+        if perclos is None
+        else _as_1d(perclos, "perclos", n_samples).astype(np.float32)
+    )
     arrays = {
         "x": X.astype(np.float32, copy=False),
         "subject_id": subject_id,
@@ -190,13 +228,18 @@ def standardize_arrays(
         "session_id": session_id,
         "file_name": np.asarray(["standard-npz"] * n_samples, dtype=object),
         "window_id": np.arange(n_samples, dtype=np.int64),
-        "perclos_value": np.full(n_samples, np.nan, dtype=np.float32),
+        "perclos_value": perclos_value,
         "label_mode": np.asarray(["standard"] * n_samples, dtype=object),
         "is_valid_binary_sample": np.ones(n_samples, dtype=bool),
     }
     if labels is not None:
         arrays["y"] = labels
         arrays["label"] = labels
+    if extra_arrays is not None:
+        for key, values in extra_arrays.items():
+            if key in arrays or key in {"X", "subjects", "sessions", "sample_ids", "y"}:
+                raise ValueError(f"{key} is reserved and cannot be used as an extra array")
+            arrays[key] = _as_1d(values, key, n_samples)
     meta = {
         "sfreq": None if sfreq is None else float(sfreq),
         "channel_names": channel_names,
@@ -214,10 +257,12 @@ def save_standard_dataset(
     subjects: np.ndarray,
     sessions: np.ndarray | None = None,
     sample_ids: np.ndarray | None = None,
+    perclos: np.ndarray | None = None,
     sfreq: float | None = None,
     channel_names: list[str] | None = None,
     label_names: dict[int, str] | None = None,
     metadata: dict[str, Any] | None = None,
+    extra_arrays: dict[str, np.ndarray] | None = None,
 ) -> None:
     arrays, meta = standardize_arrays(
         X=X,
@@ -225,16 +270,19 @@ def save_standard_dataset(
         subjects=subjects,
         sessions=sessions,
         sample_ids=sample_ids,
+        perclos=perclos,
         sfreq=sfreq,
         channel_names=channel_names,
         label_names=label_names,
         metadata=metadata,
+        extra_arrays=extra_arrays,
     )
     payload = {
         "X": arrays["x"],
         "subjects": arrays["subject_id"],
         "sessions": arrays["session_id"],
         "sample_ids": arrays["sample_id"],
+        "perclos": arrays["perclos_value"],
     }
     if y is not None:
         payload["y"] = arrays["y"]
@@ -246,6 +294,9 @@ def save_standard_dataset(
         payload["label_names_json"] = np.asarray(json.dumps(label_names), dtype=object)
     if metadata is not None:
         payload["metadata_json"] = np.asarray(json.dumps(metadata), dtype=object)
+    if extra_arrays is not None:
+        for key in extra_arrays:
+            payload[key] = arrays[key]
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(path, **payload)
@@ -260,10 +311,24 @@ def load_standard_dataset(path: str | Path) -> tuple[dict[str, np.ndarray], dict
         subjects = data["subjects"]
         sessions = data["sessions"] if "sessions" in data else None
         sample_ids = data["sample_ids"] if "sample_ids" in data else None
+        perclos = data["perclos"] if "perclos" in data else None
         sfreq = float(np.asarray(data["sfreq"]).item()) if "sfreq" in data else None
         channel_names = data["channel_names"].astype(str).tolist() if "channel_names" in data else None
         label_names = _json_scalar(data["label_names_json"]) if "label_names_json" in data else None
         metadata = _json_scalar(data["metadata_json"]) if "metadata_json" in data else None
+        reserved = {
+            "X",
+            "y",
+            "subjects",
+            "sessions",
+            "sample_ids",
+            "perclos",
+            "sfreq",
+            "channel_names",
+            "label_names_json",
+            "metadata_json",
+        }
+        extra_arrays = {key: data[key] for key in data.files if key not in reserved}
     if label_names is not None:
         label_names = {int(k): v for k, v in label_names.items()}
     return standardize_arrays(
@@ -272,10 +337,12 @@ def load_standard_dataset(path: str | Path) -> tuple[dict[str, np.ndarray], dict
         subjects=subjects,
         sessions=sessions,
         sample_ids=sample_ids,
+        perclos=perclos,
         sfreq=sfreq,
         channel_names=channel_names,
         label_names=label_names,
         metadata=metadata,
+        extra_arrays=extra_arrays,
     )
 
 
@@ -287,8 +354,10 @@ def standard_counts(arrays: dict[str, np.ndarray]) -> dict[str, int]:
         counts = np.bincount(y.astype(np.int64), minlength=2)
         alert = int(counts[0])
         fatigue = int(counts[1])
+    sessions = arrays.get("session_id")
+    session_count = len(set(sessions.tolist())) if sessions is not None else len(set(arrays["subject_id"].tolist()))
     return {
-        "sessions": len(set(arrays["subject_id"].tolist())),
+        "sessions": session_count,
         "usable": int(len(arrays["x"])),
         "alert": alert,
         "fatigue": fatigue,
@@ -306,3 +375,20 @@ def _as_1d(values: np.ndarray, name: str, n_samples: int) -> np.ndarray:
 def _json_scalar(value: np.ndarray) -> Any:
     raw = np.asarray(value).item()
     return json.loads(str(raw))
+
+
+def standard_extra_arrays(arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    reserved = {
+        "x",
+        "y",
+        "label",
+        "subject_id",
+        "sample_id",
+        "session_id",
+        "file_name",
+        "window_id",
+        "perclos_value",
+        "label_mode",
+        "is_valid_binary_sample",
+    }
+    return {key: value for key, value in arrays.items() if key not in reserved}

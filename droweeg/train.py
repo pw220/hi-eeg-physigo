@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+
+import numpy as np
 
 from droweeg.config import kwargs_to_argv, load_config
 from droweeg.datasets.base import EEGDataset
@@ -29,7 +32,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--raw-data-dir", default=None)
     parser.add_argument("--label-dir", default=None)
-    parser.add_argument("--sadt-balanced-path", default="data/sad-data.mat")
+    parser.add_argument("--sadt-balanced-path", default="data/processed/sadt/sad-data.mat")
+    parser.add_argument("--path", default=None, help="Dataset path alias, mainly for --dataset standard-npz.")
     parser.add_argument("--standard-npz-path", default=None)
     parser.add_argument("--label-mode", choices=("threshold35", "strict035070"), default="threshold35")
     parser.add_argument("--epochs", type=int, default=50)
@@ -74,7 +78,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     args = parse_args(argv)
     backend_argv = to_backend_argv(args)
     run_backend(backend_argv)
-    return {"status": "completed", "backend_args": backend_argv}
+    return build_result(args, backend_argv)
 
 
 def run_from_kwargs(**kwargs) -> dict[str, Any]:
@@ -173,9 +177,10 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
         argv.extend(["--sadt-path", str(args.sadt_balanced_path)])
         argv.extend(["--dataset-display-name", "sadt-balanced"])
     else:
-        if args.standard_npz_path is None:
-            raise ValueError("--dataset standard-npz requires --standard-npz-path")
-        argv.extend(["--standard-npz-path", str(args.standard_npz_path)])
+        standard_npz_path = args.standard_npz_path or args.path
+        if standard_npz_path is None:
+            raise ValueError("--dataset standard-npz requires --standard-npz-path or --path")
+        argv.extend(["--standard-npz-path", str(standard_npz_path)])
         argv.extend(["--dataset-display-name", "standard-npz"])
     if args.run_all_loso:
         argv.append("--run-all-loso")
@@ -194,6 +199,65 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
     if args.overwrite:
         argv.append("--overwrite")
     return argv
+
+
+def build_result(args: argparse.Namespace, backend_argv: list[str]) -> dict[str, Any]:
+    label_protocol = label_protocol_for_args(args)
+    output_dir = _resolve_output_dir(args.output_dir, args.dataset, args.model, args.method, label_protocol)
+    outputs_enabled = output_dir.strip().lower() not in {"none", "null", "off", "false"}
+    result: dict[str, Any] = {
+        "status": "completed",
+        "backend_args": backend_argv,
+        "dataset": args.dataset,
+        "model": args.model,
+        "method": args.method,
+        "protocol": args.protocol,
+        "label_protocol": label_protocol,
+        "target_subject": args.target_subject,
+        "run_all_loso": args.run_all_loso,
+        "dry_run": args.dry_run,
+        "outputs_enabled": outputs_enabled,
+        "output_dir": None if not outputs_enabled else output_dir,
+    }
+    if not outputs_enabled:
+        return result
+
+    root = Path(output_dir)
+    stem = f"{args.dataset}_{args.model}_{args.method}_{label_protocol}"
+    paths = {
+        "predictions_dir": root / "predictions",
+        "checkpoints_dir": root / "checkpoints",
+        "summaries_dir": root / "summaries",
+        "reports_dir": root / "reports",
+        "summary_path": root / "summaries" / f"{stem}_summary.csv",
+        "manifest_path": root / "checkpoints" / "checkpoints_manifest.csv",
+    }
+    result.update({key: str(path) for key, path in paths.items()})
+    summary_path = paths["summary_path"]
+    if summary_path.exists():
+        try:
+            import pandas as pd
+
+            result["summary"] = pd.read_csv(summary_path)
+        except Exception as exc:  # noqa: BLE001 - result metadata should not fail training
+            result["summary_load_error"] = repr(exc)
+    return result
+
+
+def label_protocol_for_args(args: argparse.Namespace) -> str:
+    if args.dataset == "seedvig":
+        return args.label_mode
+    if args.dataset == "sadt-balanced":
+        return "rt_binary"
+    standard_npz_path = args.standard_npz_path or args.path
+    if standard_npz_path is not None and Path(standard_npz_path).exists():
+        with np.load(standard_npz_path, allow_pickle=True) as data:
+            if "metadata_json" in data:
+                metadata = json.loads(str(np.asarray(data["metadata_json"]).item()))
+                protocol_name = metadata.get("protocol_name")
+                if protocol_name:
+                    return str(protocol_name)
+    return "standard"
 
 
 def _resolve_output_dir(output_dir: str, dataset: str, model: str, method: str, label_protocol: str) -> str:

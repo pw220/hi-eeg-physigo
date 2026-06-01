@@ -24,6 +24,7 @@ For binary drowsiness recognition:
 
 - `sessions`: session IDs, shape `(N,)`.
 - `sample_ids`: sample IDs, shape `(N,)`.
+- `perclos`: PERCLOS values, shape `(N,)`, useful for SEED-VIG audits.
 - `sfreq`: sampling rate.
 - `channel_names`: list of channel names.
 - `label_names`: mapping such as `{0: "alert", 1: "fatigue"}`.
@@ -75,7 +76,7 @@ print(dataset.get_metadata())
 ```bash
 python -m droweeg.train \
   --dataset standard-npz \
-  --standard-npz-path my_dataset.npz \
+  --path my_dataset.npz \
   --model eegnet \
   --method source_only \
   --protocol loso \
@@ -91,7 +92,7 @@ Current source-only metrics assume binary labels. Future source-free adaptation 
 Official adapters such as `seedvig` and `sadt-balanced` convert known public dataset layouts into this same standard representation:
 
 ```python
-sadt = droweeg.dataset("sadt-balanced", path="data/sad-data.mat")
+sadt = droweeg.dataset("sadt-balanced", path="data/processed/sadt/sad-data.mat")
 standard = sadt.to_standard_dataset()
 print(standard.get_metadata())
 ```

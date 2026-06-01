@@ -19,7 +19,7 @@ class SADTBalancedDataset(EEGDataset):
     input_samples = 384
     num_classes = 2
 
-    def __init__(self, path: str | Path = "data/sad-data.mat", **_: object) -> None:
+    def __init__(self, path: str | Path = "data/processed/sadt/sad-data.mat", **_: object) -> None:
         self.path = Path(path)
         self._arrays: dict[str, np.ndarray] | None = None
 

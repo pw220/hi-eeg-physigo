@@ -100,7 +100,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-root", default="data/raw/SEED-VIG")
     parser.add_argument("--raw-data-dir", default=None)
     parser.add_argument("--label-dir", default=None)
-    parser.add_argument("--sadt-path", default="data/sad-data.mat")
+    parser.add_argument("--sadt-path", default="data/processed/sadt/sad-data.mat")
     parser.add_argument("--standard-npz-path", default=None)
     parser.add_argument("--target-subject", type=int, default=1)
     parser.add_argument("--run-all-loso", action="store_true")
@@ -187,6 +187,7 @@ def main(argv: list[str] | None = None) -> None:
     target_subjects = resolve_target_subjects(args, context.subjects)
 
     print_global_plan_header(args, context, target_subjects)
+    print_model_selection_policy(args)
     plans = [
         plan_loso_fold(
             args=args,
@@ -312,11 +313,13 @@ def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> Datase
         print(f"  path={args.standard_npz_path}")
         print(f"  samples={len(arrays['y'])}")
         print(f"  subjects={subjects}")
-        print("  label_protocol=standard")
+        standard_metadata = metadata.get("metadata", {})
+        label_protocol = str(standard_metadata.get("protocol_name", "standard"))
+        print(f"  label_protocol={label_protocol}")
         return DatasetContext(
             dataset=args.dataset_display_name or "standard-npz",
             model_name=args.model,
-            label_protocol="standard",
+            label_protocol=label_protocol,
             input_channels=int(arrays["x"].shape[1]),
             input_samples=int(arrays["x"].shape[2]),
             num_classes=int(max(labels)) + 1,
@@ -706,7 +709,8 @@ def run_loso_fold(
     if args.test_every_epochs > 0:
         print(
             "target_interval_evaluation=diagnostic_only "
-            "target labels are not used for training, checkpoint selection, early stopping, or model selection"
+            "target labels are not used for training, checkpoint selection, early stopping, or model selection; "
+            f"final checkpoint still follows checkpoint_policy={args.checkpoint_policy}"
         )
 
     class_weights = compute_class_weights(train["y"], args.class_balance)
@@ -1994,6 +1998,30 @@ def print_global_plan_header(args: argparse.Namespace, context: DatasetContext, 
         print("  label_rule=standard: integer class IDs, binary source-only metrics expect 0 alert and 1 fatigue")
 
 
+def print_model_selection_policy(args: argparse.Namespace) -> None:
+    print("model_selection_policy")
+    print(f"  validation_mode={args.validation_mode}")
+    print(f"  checkpoint_policy={args.checkpoint_policy}")
+    print(f"  early_stop_enabled={early_stop_enabled(args)}")
+    if args.validation_mode == "none":
+        print("  validation_metrics=disabled")
+        print("  model_selection_source=no validation set")
+        print("  target_labels_for_model_selection=False")
+        if args.test_every_epochs > 0:
+            print(
+                "  target_interval_diagnostics=audit_only; best target diagnostic epoch is reported for analysis "
+                "but is never selected automatically"
+            )
+        if args.checkpoint_policy == "last" and args.epochs >= 100:
+            print(
+                "  warning=with validation_mode=none and checkpoint_policy=last, long runs may overtrain; "
+                "use fixed_epoch for a pre-declared epoch or add source-only validation for checkpoint selection"
+            )
+    else:
+        print(f"  model_selection_source=source validation data via {args.validation_mode}")
+        print("  target_labels_for_model_selection=False")
+
+
 def print_fold_plan(plan: FoldPlan, *, dry_run: bool) -> None:
     prefix = "dry_run_fold_plan" if dry_run else "fold_plan"
     print(prefix)
@@ -2227,28 +2255,33 @@ def stratified_metadata_counts(source_counts: dict[str, int], val_ratio: float) 
 
 def print_recommended_gpu_command(args: argparse.Namespace) -> None:
     print("recommended_later_gpu_command")
-    if args.dataset == "standard-npz":
+    if args.dataset == "seedvig":
+        path_args = ""
+        if args.raw_data_dir is not None and args.label_dir is not None:
+            path_args = f" --raw-data-dir {args.raw_data_dir} --label-dir {args.label_dir}"
         print(
-            "python -m droweeg.train --dataset standard-npz --standard-npz-path my_dataset.npz "
-            "--model eegnet --method source_only --protocol loso --run-all-loso --epochs 50 "
-            "--batch-size 64 --device cuda --validation-mode none --checkpoint-policy last"
+            "python -m droweeg.train --dataset seedvig --model eegnet --method source_only --protocol loso "
+            "--run-all-loso --epochs 100 --batch-size 64 --device cuda --label-mode threshold35 "
+            "--class-balance weighted_loss --optimizer adamw --weight-decay 0.0001 "
+            "--early-stop-patience 15 --monitor-metric macro_f1"
+            f"{path_args}"
         )
         return
     if args.dataset == "sadt":
         print(
-            "python train_eegnet_source.py --dataset sadt --model eegnet "
-            f"--sadt-path {args.sadt_path} --run-all-loso --epochs 50 --batch-size 64 "
-            "--device cuda --validation-mode sample_stratified "
+            "python -m droweeg.train --dataset sadt-balanced --model eegnet --method source_only --protocol loso "
+            f"--sadt-balanced-path {args.sadt_path} --run-all-loso --epochs 50 --batch-size 64 "
+            "--device cuda --validation-mode none --checkpoint-policy last "
             f"--class-balance {args.class_balance}"
         )
         return
-
-    print(
-        "python train_eegnet_source.py --dataset seedvig --model eegnet --run-all-loso "
-        "--epochs 100 --batch-size 64 --device cuda --label-mode threshold35 "
-        "--class-balance weighted_loss --optimizer adamw --weight-decay 0.0001 "
-        "--early-stop-patience 15 --monitor-metric macro_f1 --lr-scheduler plateau"
-    )
+    if args.dataset == "standard-npz":
+        print(
+            "python -m droweeg.train --dataset standard-npz --path my_dataset.npz "
+            "--model eegnet --method source_only --protocol loso --run-all-loso --epochs 50 "
+            "--batch-size 64 --device cuda --validation-mode none --checkpoint-policy last"
+        )
+        return
 
 
 if __name__ == "__main__":

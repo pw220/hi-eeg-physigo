@@ -132,7 +132,7 @@ def _distribution(values: np.ndarray) -> dict[int, int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect SADT processed EEG .mat file")
-    parser.add_argument("--sadt-path", default="data/sad-data.mat")
+    parser.add_argument("--sadt-path", default="data/processed/sadt/sad-data.mat")
     args = parser.parse_args()
     inspect_sadt(args.sadt_path)
 
