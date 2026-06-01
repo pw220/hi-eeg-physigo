@@ -1,0 +1,108 @@
+{
+  "description": "Frozen source-only regression metrics generated from train_eegnet_source.py.",
+  "config": {
+    "toy": {
+      "n_subjects": 4,
+      "samples_per_subject": 8,
+      "channels": 3,
+      "samples": 64,
+      "random_state": 42
+    },
+    "run": {
+      "epochs": 5,
+      "batch_size": 4,
+      "seed": 42,
+      "validation_mode": "none",
+      "checkpoint_policy": "last",
+      "class_balance": "weighted_loss",
+      "loss_type": "weighted_ce",
+      "optimizer": "adam",
+      "lr": 0.001,
+      "weight_decay": 0.0,
+      "eegnet_temporal_kernel": 16,
+      "eegnet_separable_kernel": 8
+    }
+  },
+  "metric_keys": [
+    "target_subject",
+    "target_subject_raw",
+    "accuracy",
+    "balanced_accuracy",
+    "macro_f1",
+    "fatigue_precision",
+    "fatigue_recall",
+    "specificity",
+    "roc_auc",
+    "auprc",
+    "tn",
+    "fp",
+    "fn",
+    "tp"
+  ],
+  "fold_metrics": [
+    {
+      "target_subject": 1,
+      "target_subject_raw": 1,
+      "accuracy": 0.25,
+      "balanced_accuracy": 0.25,
+      "macro_f1": 0.2,
+      "fatigue_precision": 0.0,
+      "fatigue_recall": 0.0,
+      "specificity": 0.5,
+      "roc_auc": 0.3125,
+      "auprc": 0.4511904761904762,
+      "tn": 2,
+      "fp": 2,
+      "fn": 4,
+      "tp": 0
+    },
+    {
+      "target_subject": 2,
+      "target_subject_raw": 2,
+      "accuracy": 0.625,
+      "balanced_accuracy": 0.625,
+      "macro_f1": 0.6190476190476191,
+      "fatigue_precision": 0.6666666666666666,
+      "fatigue_recall": 0.5,
+      "specificity": 0.75,
+      "roc_auc": 0.5625,
+      "auprc": 0.6916666666666667,
+      "tn": 3,
+      "fp": 1,
+      "fn": 2,
+      "tp": 2
+    },
+    {
+      "target_subject": 3,
+      "target_subject_raw": 3,
+      "accuracy": 0.75,
+      "balanced_accuracy": 0.75,
+      "macro_f1": 0.75,
+      "fatigue_precision": 0.75,
+      "fatigue_recall": 0.75,
+      "specificity": 0.75,
+      "roc_auc": 0.5625,
+      "auprc": 0.6041666666666666,
+      "tn": 3,
+      "fp": 1,
+      "fn": 1,
+      "tp": 3
+    },
+    {
+      "target_subject": 4,
+      "target_subject_raw": 4,
+      "accuracy": 0.5,
+      "balanced_accuracy": 0.5,
+      "macro_f1": 0.4666666666666667,
+      "fatigue_precision": 0.5,
+      "fatigue_recall": 0.75,
+      "specificity": 0.25,
+      "roc_auc": 0.5625,
+      "auprc": 0.6041666666666666,
+      "tn": 1,
+      "fp": 3,
+      "fn": 1,
+      "tp": 3
+    }
+  ]
+}
