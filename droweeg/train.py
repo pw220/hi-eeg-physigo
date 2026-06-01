@@ -12,6 +12,7 @@ from droweeg.config import kwargs_to_argv, load_config
 from droweeg.datasets.base import EEGDataset
 from droweeg.datasets.standard_npz import StandardDataset
 from droweeg.engine import run_backend
+from droweeg.results import DrowEEGResults
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -31,8 +32,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", choices=("eegnet",), default="eegnet")
     parser.add_argument("--method", choices=("source_only",), default="source_only")
     parser.add_argument("--protocol", choices=("loso",), default="loso")
-    parser.add_argument("--target-subject", type=int, default=1)
+    parser.add_argument("--target-subject", default="1")
     parser.add_argument("--target-subjects", default=None, help="Comma-separated fold subject indices, e.g. 1,2,3.")
+    parser.add_argument("--target-id-space", "--target-subject-id-space", choices=("canonical", "raw"), default="canonical")
     parser.add_argument("--run-all-loso", action="store_true")
     parser.add_argument("--max-folds", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
@@ -41,7 +43,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sadt-balanced-path", default="data/processed/sadt/sad-balance.mat")
     parser.add_argument("--path", default=None, help="Dataset path alias, mainly for --dataset standard-npz.")
     parser.add_argument("--standard-npz-path", default=None)
-    parser.add_argument("--label-mode", choices=("threshold35", "strict035070"), default="threshold35")
+    parser.add_argument("--label-mode", choices=("threshold35", "strict035070"), default=None)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
@@ -57,7 +59,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--validation-mode", choices=("subject_split", "sample_stratified", "none"), default="subject_split")
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--val-subject-ratio", type=float, default=0.2)
-    parser.add_argument("--checkpoint-policy", choices=("best_val", "last", "fixed_epoch"), default="best_val")
+    parser.add_argument("--checkpoint-policy", choices=("best_val", "last", "fixed_epoch"), default=None)
     parser.add_argument("--fixed-eval-epoch", type=int, default=None)
     parser.add_argument("--disable-early-stop", action="store_true")
     parser.add_argument("--early-stop-patience", type=int, default=0)
@@ -67,6 +69,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="macro_f1",
     )
     parser.add_argument("--output-dir", default="outputs")
+    parser.add_argument("--epoch-log-interval", type=int, default=10)
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--test-every-epochs", type=int, default=0)
@@ -81,7 +84,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> dict[str, Any]:
+def main(argv: list[str] | None = None) -> DrowEEGResults:
     args = parse_args(argv)
     validate_target_selection(args)
     backend_argv = to_backend_argv(args)
@@ -89,7 +92,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     return build_result(args, backend_argv)
 
 
-def run_from_kwargs(**kwargs) -> dict[str, Any]:
+def run_from_kwargs(**kwargs) -> DrowEEGResults:
+    if kwargs.get("data") is not None and kwargs.get("dataset") is not None:
+        raise ValueError("Provide either data or dataset, not both.")
     if kwargs.get("data") is not None:
         kwargs = dict(kwargs)
         kwargs.setdefault("dataset", "standard-npz")
@@ -114,7 +119,7 @@ def run_from_kwargs(**kwargs) -> dict[str, Any]:
 def to_backend_argv(args: argparse.Namespace) -> list[str]:
     dataset_name = effective_dataset(args)
     if dataset_name == "seedvig":
-        label_protocol = args.label_mode
+        label_protocol = args.label_mode or "threshold35"
     elif dataset_name == "sadt-balanced":
         label_protocol = "rt_binary"
     else:
@@ -155,8 +160,6 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
         str(args.val_ratio),
         "--val-subject-ratio",
         str(args.val_subject_ratio),
-        "--checkpoint-policy",
-        args.checkpoint_policy,
         "--early-stop-patience",
         str(args.early_stop_patience),
         "--monitor-metric",
@@ -167,6 +170,8 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
         "droweeg",
         "--test-every-epochs",
         str(args.test_every_epochs),
+        "--epoch-log-interval",
+        str(args.epoch_log_interval),
         "--eegnet-f1",
         str(args.eegnet_f1),
         "--eegnet-d",
@@ -183,7 +188,7 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
         str(args.eegnet_norm_rate),
     ]
     if dataset_name == "seedvig":
-        argv.extend(["--label-mode", args.label_mode])
+        argv.extend(["--label-mode", args.label_mode or "threshold35"])
         if args.raw_data_dir is not None:
             argv.extend(["--raw-data-dir", str(args.raw_data_dir)])
         if args.label_dir is not None:
@@ -197,12 +202,17 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
             raise ValueError("Standard dataset training requires --data, --standard-npz-path, or --path")
         argv.extend(["--standard-npz-path", str(standard_npz_path)])
         argv.extend(["--dataset-display-name", dataset_key])
+        if args.label_mode is not None:
+            argv.extend(["--label-mode", args.label_mode])
+    if args.checkpoint_policy is not None:
+        argv.extend(["--checkpoint-policy", args.checkpoint_policy])
     if args.run_all_loso:
         argv.append("--run-all-loso")
     if args.target_subjects is not None:
         argv.extend(["--target-subjects", target_subjects_to_cli(args.target_subjects)])
     else:
         argv.extend(["--target-subject", str(args.target_subject)])
+    argv.extend(["--target-id-space", args.target_id_space])
     if args.max_folds is not None:
         argv.extend(["--max-folds", str(args.max_folds)])
     if args.dry_run:
@@ -220,7 +230,7 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
     return argv
 
 
-def build_result(args: argparse.Namespace, backend_argv: list[str]) -> dict[str, Any]:
+def build_result(args: argparse.Namespace, backend_argv: list[str]) -> DrowEEGResults:
     label_protocol = label_protocol_for_args(args)
     dataset_name = effective_dataset(args)
     dataset_key = dataset_key_for_args(args)
@@ -238,13 +248,14 @@ def build_result(args: argparse.Namespace, backend_argv: list[str]) -> dict[str,
         "label_protocol": label_protocol,
         "target_subject": args.target_subject,
         "target_subjects": None if args.target_subjects is None else parse_target_subjects_value(args.target_subjects),
+        "target_id_space": args.target_id_space,
         "run_all_loso": args.run_all_loso,
         "dry_run": args.dry_run,
         "outputs_enabled": outputs_enabled,
         "output_dir": None if not outputs_enabled else output_dir,
     }
     if not outputs_enabled:
-        return result
+        return DrowEEGResults(result)
 
     root = Path(output_dir)
     stem = f"{dataset_key}_{args.model}_{args.method}_{label_protocol}"
@@ -265,13 +276,13 @@ def build_result(args: argparse.Namespace, backend_argv: list[str]) -> dict[str,
             result["summary"] = pd.read_csv(summary_path)
         except Exception as exc:  # noqa: BLE001 - result metadata should not fail training
             result["summary_load_error"] = repr(exc)
-    return result
+    return DrowEEGResults(result)
 
 
 def label_protocol_for_args(args: argparse.Namespace) -> str:
     dataset_name = effective_dataset(args)
     if dataset_name == "seedvig":
-        return args.label_mode
+        return args.label_mode or "threshold35"
     if dataset_name == "sadt-balanced":
         return "rt_binary"
     standard_npz_path = standard_npz_path_for_args(args)
@@ -299,10 +310,10 @@ def target_subjects_to_cli(value: object) -> str:
     return str(value)
 
 
-def parse_target_subjects_value(value: object) -> list[int]:
+def parse_target_subjects_value(value: object) -> list[int | str]:
     if isinstance(value, (list, tuple)):
-        return [int(item) for item in value]
-    return [int(part) for part in str(value).replace(" ", "").split(",") if part]
+        return [int(item) if str(item).lstrip("-").isdigit() else str(item) for item in value]
+    return [int(part) if part.lstrip("-").isdigit() else part for part in str(value).replace(" ", "").split(",") if part]
 
 
 def effective_dataset(args: argparse.Namespace) -> str:

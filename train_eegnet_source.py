@@ -44,7 +44,16 @@ from utils.seed import set_seed
 
 
 LOG_LEVELS = {"quiet": 0, "normal": 1, "verbose": 2, "debug": 3}
-CORE_METRIC_KEYS = ["accuracy", "balanced_accuracy", "macro_f1", "roc_auc", "auprc"]
+CORE_METRIC_KEYS = [
+    "accuracy",
+    "balanced_accuracy",
+    "macro_f1",
+    "fatigue_precision",
+    "fatigue_recall",
+    "specificity",
+    "roc_auc",
+    "auprc",
+]
 DISPLAY_METRIC_KEYS = [
     "accuracy",
     "balanced_accuracy",
@@ -122,16 +131,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--label-dir", default=None)
     parser.add_argument("--sadt-path", default="data/processed/sadt/sad-data.mat")
     parser.add_argument("--standard-npz-path", default=None)
-    parser.add_argument("--target-subject", type=int, default=1)
+    parser.add_argument("--target-subject", default="1")
     parser.add_argument(
         "--target-subjects",
         default=None,
         help="Comma-separated 1-based fold subject indices, e.g. 1,2,3. Mutually exclusive with --run-all-loso.",
     )
+    parser.add_argument("--target-id-space", choices=("canonical", "raw"), default="canonical")
     parser.add_argument("--run-all-loso", action="store_true")
     parser.add_argument("--max-folds", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--label-mode", choices=("threshold35", "strict035070"), default="threshold35")
+    parser.add_argument("--label-mode", choices=("threshold35", "strict035070"), default=None)
     parser.add_argument("--class-balance", choices=("none", "weighted_loss"), default="weighted_loss")
     parser.add_argument(
         "--loss-type",
@@ -161,7 +171,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--val-subject-ratio", type=float, default=0.2)
     parser.add_argument("--validation-mode", choices=("subject_split", "sample_stratified", "none"), default="subject_split")
     parser.add_argument("--val-ratio", type=float, default=0.2)
-    parser.add_argument("--checkpoint-policy", choices=("best_val", "last", "fixed_epoch"), default="best_val")
+    parser.add_argument("--checkpoint-policy", choices=("best_val", "last", "fixed_epoch"), default=None)
     parser.add_argument("--fixed-eval-epoch", type=int, default=None)
     parser.add_argument("--disable-early-stop", action="store_true")
     parser.add_argument(
@@ -192,9 +202,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--debug-repro", action="store_true")
     parser.add_argument("--log-level", choices=("quiet", "normal", "verbose", "debug"), default="normal")
+    parser.add_argument("--epoch-log-interval", type=int, default=10)
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda", "mps"))
     parser.add_argument("--min-class-samples", type=int, default=1)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    raw_argv = sys.argv[1:] if argv is None else argv
+    args.label_mode_explicit = _argument_was_provided(raw_argv, "--label-mode")
+    args.checkpoint_policy_explicit = _argument_was_provided(raw_argv, "--checkpoint-policy")
+    resolve_protocol_defaults(args)
+    return args
+
+
+def _argument_was_provided(argv: list[str], name: str) -> bool:
+    return any(item == name or item.startswith(f"{name}=") for item in argv)
+
+
+def resolve_protocol_defaults(args: argparse.Namespace) -> None:
+    if args.dataset == "seedvig" and args.label_mode is None:
+        args.label_mode = "threshold35"
+    if args.checkpoint_policy is None:
+        args.checkpoint_policy = "last" if args.validation_mode == "none" else "best_val"
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -210,7 +237,7 @@ def main(argv: list[str] | None = None) -> None:
         outputs_dir.mkdir(parents=True, exist_ok=True)
 
     context = build_dataset_context(args, outputs_dir)
-    target_subjects = resolve_target_subjects(args, context.subjects)
+    target_subjects = resolve_target_subjects(args, context.subjects, context.subject_mapping)
     plans = [
         plan_loso_fold(
             args=args,
@@ -273,17 +300,18 @@ def main(argv: list[str] | None = None) -> None:
         print_recommended_gpu_command(args)
 
 
-def resolve_target_subjects(args: argparse.Namespace, subjects: list[int]) -> list[int]:
+def resolve_target_subjects(
+    args: argparse.Namespace,
+    subjects: list[int],
+    subject_mapping: dict[int, object],
+) -> list[int]:
     if args.run_all_loso and args.target_subjects:
         raise ValueError(
             "--run-all-loso cannot be used with --target-subjects. "
             "Use --run-all-loso for every fold, or --target-subjects for a selected subset."
         )
     if args.target_subjects:
-        selected = parse_target_subjects(args.target_subjects)
-        unknown = [subject for subject in selected if subject not in subjects]
-        if unknown:
-            raise ValueError(f"Target subjects {unknown} not found. Available fold subject indices: {subjects}")
+        selected = resolve_subject_tokens(parse_target_subjects(args.target_subjects), args.target_id_space, subjects, subject_mapping)
         return selected
     if args.run_all_loso:
         selected = subjects
@@ -292,25 +320,68 @@ def resolve_target_subjects(args: argparse.Namespace, subjects: list[int]) -> li
         if not selected:
             raise ValueError("No target subjects available for --run-all-loso")
         return selected
-    if args.target_subject not in subjects:
-        raise ValueError(f"Target subject {args.target_subject} not found. Available fold subject indices: {subjects}")
-    return [args.target_subject]
+    return [resolve_subject_token(str(args.target_subject), args.target_id_space, subjects, subject_mapping)]
 
 
-def parse_target_subjects(raw: str) -> list[int]:
+def parse_target_subjects(raw: str) -> list[str]:
     values = []
     for part in str(raw).replace(" ", "").split(","):
         if not part:
             continue
-        try:
-            value = int(part)
-        except ValueError as exc:
-            raise ValueError(f"--target-subjects must be comma-separated integers, got: {raw}") from exc
+        value = part
         if value not in values:
             values.append(value)
     if not values:
         raise ValueError("--target-subjects was provided but no subjects were parsed")
     return values
+
+
+def resolve_subject_tokens(
+    tokens: list[str],
+    id_space: str,
+    subjects: list[int],
+    subject_mapping: dict[int, object],
+) -> list[int]:
+    selected = [resolve_subject_token(token, id_space, subjects, subject_mapping) for token in tokens]
+    deduped = []
+    for subject in selected:
+        if subject not in deduped:
+            deduped.append(subject)
+    return deduped
+
+
+def resolve_subject_token(
+    token: str,
+    id_space: str,
+    subjects: list[int],
+    subject_mapping: dict[int, object],
+) -> int:
+    if id_space == "canonical":
+        try:
+            subject = int(token)
+        except ValueError as exc:
+            raise ValueError(f"Canonical target subject IDs must be integers. {valid_subject_message(subjects, subject_mapping)}") from exc
+        if subject not in subjects:
+            raise ValueError(f"Target subject {subject} not found. {valid_subject_message(subjects, subject_mapping)}")
+        return subject
+    for canonical_id, raw_id in subject_mapping.items():
+        if raw_id_matches(token, raw_id):
+            return int(canonical_id)
+    raise ValueError(f"Raw target subject {token!r} not found. {valid_subject_message(subjects, subject_mapping)}")
+
+
+def raw_id_matches(token: str, raw_id: object) -> bool:
+    if token == str(raw_id):
+        return True
+    try:
+        return float(token) == float(raw_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def valid_subject_message(subjects: list[int], subject_mapping: dict[int, object]) -> str:
+    raw_ids = [subject_mapping.get(subject, subject) for subject in subjects]
+    return f"Valid canonical IDs: {subjects}; valid raw IDs: {raw_ids}."
 
 
 def should_log(args: argparse.Namespace, level: str) -> bool:
@@ -448,6 +519,8 @@ def validate_training_args(args: argparse.Namespace) -> None:
         print("warning: validation-mode=none disables early stopping because no validation metrics are computed")
     if args.test_every_epochs < 0:
         raise ValueError("--test-every-epochs must be non-negative; use 0 for final-only target evaluation")
+    if args.epoch_log_interval <= 0:
+        raise ValueError("--epoch-log-interval must be a positive integer")
     if args.dataset in {"sadt", "standard-npz"} and args.bandpass:
         raise ValueError("--bandpass is not supported for pre-windowed array datasets")
     if args.dataset == "standard-npz" and args.standard_npz_path is None:
@@ -675,8 +748,8 @@ def plan_loso_fold(
         f"--val-subject-ratio {args.val_subject_ratio} "
         f"--checkpoint-policy {args.checkpoint_policy} "
         f"--test-every-epochs {args.test_every_epochs} "
+        f"--epoch-log-interval {args.epoch_log_interval} "
         f"--device {args.device} "
-        f"--label-mode {args.label_mode} "
         f"--class-balance {args.class_balance} "
         f"--loss-type {args.loss_type} "
         f"--eegnet-f1 {args.eegnet_f1} "
@@ -690,6 +763,9 @@ def plan_loso_fold(
         f"--eegnet-norm-rate {args.eegnet_norm_rate} "
         f"--output-dir {shlex.quote(str(args.output_dir))}"
     )
+    if args.label_mode is not None:
+        command += f" --label-mode {args.label_mode}"
+    command += f" --target-id-space canonical"
     if args.raw_data_dir is not None and args.label_dir is not None:
         command += f" --raw-data-dir {shlex.quote(str(args.raw_data_dir))}"
         command += f" --label-dir {shlex.quote(str(args.label_dir))}"
@@ -970,7 +1046,7 @@ def run_loso_fold(
     test_probs = softmax(test_logits)
     test_pred = test_probs.argmax(axis=1)
     test_metrics = classification_metrics(test_y, test_pred, test_probs[:, 1])
-    print_fold_result(args, test_metrics)
+    print_fold_result(args, test_metrics, plan)
     has_validation = val_loader is not None
     if test_metrics_history:
         test_metrics_history.append(metrics_history_row(selected_epoch, test_metrics, reason="final_selected_checkpoint"))
@@ -1327,8 +1403,16 @@ def write_run_reports(
             "num_classes": context.num_classes,
             "subjects": context.subjects,
             "subject_mapping": context.subject_mapping,
+            "target_id_space": args.target_id_space,
             "selected_targets": target_subjects,
             "selected_target_raw_ids": raw_subject_ids(context, target_subjects),
+            "selected_targets_display": format_selected_targets(context, target_subjects),
+            "label_config": {
+                "label_mode": args.label_mode,
+                "label_mode_explicit": bool(getattr(args, "label_mode_explicit", False)),
+                "label_mode_applicable": context.dataset == "seedvig",
+                "label_protocol": context.label_protocol,
+            },
         },
     )
     write_json(root / "reproducibility.json", repro_metadata)
@@ -1360,6 +1444,7 @@ def print_run_overview(
     print("Protocol       : LOSO source-only")
     print(f"Model          : {'EEGNet' if context.model_name == 'eegnet' else context.model_name}")
     print(f"Subjects       : {len(context.subjects)} available, {len(target_subjects)} selected")
+    print(f"Selected       : {format_selected_targets(context, target_subjects)}")
     print(f"Input shape    : {context.input_channels} channels x {context.input_samples} samples")
     print(f"Classes        : {context.num_classes}")
     print(f"Label protocol : {context.label_protocol}")
@@ -1371,15 +1456,22 @@ def print_run_overview(
     print(f"Output dir     : {output_dir}")
     print("")
     print("Protocol checks")
-    print("✓ Target labels are not used for model selection")
-    print("✓ Normalization statistics are computed from source training data only")
+    print("[OK] Target labels are not used for model selection.")
+    print("[OK] Normalization statistics are computed from source training data only.")
     if args.validation_mode == "none":
-        print(f"! No validation set is used; checkpoint_policy={args.checkpoint_policy} will be used.")
-    if context.dataset != "seedvig":
-        print(f"! label_mode={args.label_mode} was provided but is not applicable to this label protocol.")
+        print(f"[WARN] No validation set is used; checkpoint_policy={args.checkpoint_policy} will be used.")
+    if context.dataset != "seedvig" and getattr(args, "label_mode_explicit", False):
+        print(f"[WARN] label_mode={args.label_mode} was provided but is not applicable to this label protocol.")
     if not args.run_all_loso and len(target_subjects) < len(context.subjects):
-        print("! Partial LOSO run: only selected target subjects will be evaluated.")
+        print(f"[WARN] Partial LOSO run: {len(target_subjects)} / {len(context.subjects)} subjects selected.")
     print("")
+
+
+def format_selected_targets(context: DatasetContext, target_subjects: list[int]) -> str:
+    return ", ".join(
+        f"{subject}(raw={context.subject_mapping.get(subject, subject)})"
+        for subject in target_subjects
+    )
 
 
 def loss_label(args: argparse.Namespace) -> str:
@@ -1410,10 +1502,7 @@ def print_compact_fold_start(plan: FoldPlan, fold_index: int, fold_total: int, *
             f"Val  : {plan.val_counts['usable']} samples | "
             f"alert={plan.val_counts['alert']} | fatigue={plan.val_counts['fatigue']}"
         )
-    print(
-        f"Test : {plan.test_counts['usable']} samples | "
-        f"alert={plan.test_counts['alert']} | fatigue={plan.test_counts['fatigue']}"
-    )
+    print(f"Test : {plan.test_counts['usable']} samples | labels hidden during training/adaptation")
     print("")
 
 
@@ -1454,19 +1543,26 @@ def epoch_metrics_row(
 def print_epoch_row(args: argparse.Namespace, row: dict[str, object], has_validation: bool, no_improve: int) -> None:
     if not should_log(args, "normal"):
         return
+    epoch = int(row["epoch"])
+    if not should_print_epoch(args, epoch):
+        return
     if has_validation:
         checkpoint = "hold" if no_improve else "best"
         print(
-            f"{int(row['epoch']):03d}   | {float(row['train_loss']):.4f} | "
+            f"{epoch:03d}   | {float(row['train_loss']):.4f} | "
             f"{format_metric(row['train_roc_auc'])}    | {format_metric(row['val_macro_f1'])}        | "
             f"{format_metric(row['val_roc_auc'])} | {float(row['lr']):.2e} | {checkpoint}"
         )
     else:
         print(
-            f"{int(row['epoch']):03d}   | {float(row['train_loss']):.4f} | "
+            f"{epoch:03d}   | {float(row['train_loss']):.4f} | "
             f"{format_metric(row['train_roc_auc'])}    | {format_metric(row['train_macro_f1'])}         | "
             f"{float(row['lr']):.2e}"
         )
+
+
+def should_print_epoch(args: argparse.Namespace, epoch: int) -> bool:
+    return epoch == 1 or epoch == args.epochs or epoch % args.epoch_log_interval == 0
 
 
 def get_git_commit_hash() -> str:
@@ -2143,14 +2239,20 @@ def update_artifacts_report(plan: FoldPlan) -> None:
     )
 
 
-def print_fold_result(args: argparse.Namespace, metrics: dict[str, object]) -> None:
+def print_fold_result(args: argparse.Namespace, metrics: dict[str, object], plan: FoldPlan) -> None:
     if not should_log(args, "normal"):
         return
     print("")
     print("Fold result")
-    print(format_metrics_inline(metrics, CORE_METRIC_KEYS))
-    print("confusion matrix:")
-    print(np.asarray(metrics["confusion_matrix"], dtype=int).tolist())
+    print(format_metrics_inline(metrics, ["accuracy", "balanced_accuracy", "macro_f1", "roc_auc", "auprc"]))
+    print(format_metrics_inline(metrics, ["fatigue_precision", "fatigue_recall", "specificity"]))
+    print("confusion matrix (rows=true, cols=pred; labels=[alert, fatigue]):")
+    matrix = np.asarray(metrics["confusion_matrix"], dtype=int)
+    print(f"[[{matrix[0, 0]}, {matrix[0, 1]}],")
+    print(f" [{matrix[1, 0]}, {matrix[1, 1]}]]")
+    print("")
+    print("Evaluation label audit:")
+    print(f"alert={plan.test_counts['alert']} | fatigue={plan.test_counts['fatigue']}")
     print("")
 
 
@@ -2173,22 +2275,61 @@ def print_final_aggregate_summary(args: argparse.Namespace, plans: list[FoldPlan
         return
     payload = json.loads(path.read_text(encoding="utf-8"))
     metrics = payload.get("metrics", {})
-    print("Final LOSO Summary")
-    print("-" * 18)
-    print(f"Completed folds: {payload.get('completed_folds', 0)} / {len(plans)}")
+    run_config_path = root / "run_config.json"
+    total_subjects = len(plans)
+    if run_config_path.exists():
+        try:
+            total_subjects = len(json.loads(run_config_path.read_text(encoding="utf-8")).get("subjects", [])) or total_subjects
+        except json.JSONDecodeError:
+            total_subjects = len(plans)
+    fold_path = fold_metrics_report_path(plans[0])
+    fold_df = pd.read_csv(fold_path) if fold_path.exists() else pd.DataFrame()
+    print("Final Selected-LOSO Summary")
+    print("-" * 27)
+    print(f"Completed selected folds: {payload.get('completed_folds', 0)} / {len(plans)}")
+    print(f"LOSO coverage           : {payload.get('completed_folds', 0)} / {total_subjects} subjects")
+    print(f"Selected targets        : {', '.join(f'{plan.target_subject}(raw={plan.target_subject_raw})' for plan in plans)}")
+    if not fold_df.empty and should_log(args, "normal"):
+        print("")
+        print("Per-fold results")
+        table_columns = [
+            "target_subject",
+            "target_subject_raw",
+            "accuracy",
+            "balanced_accuracy",
+            "macro_f1",
+            "fatigue_recall",
+            "specificity",
+            "roc_auc",
+            "auprc",
+        ]
+        table = fold_df[[column for column in table_columns if column in fold_df.columns]].copy()
+        table.rename(
+            columns={
+                "target_subject": "subject",
+                "target_subject_raw": "raw_id",
+                "balanced_accuracy": "balanced_acc",
+            },
+            inplace=True,
+        )
+        for column in table.columns:
+            if column not in {"subject", "raw_id"}:
+                table[column] = pd.to_numeric(table[column], errors="coerce").map(lambda value: f"{value:.4f}")
+        print(table.to_string(index=False))
     print("")
-    print("Metric             mean     std      min      max")
+    print("Aggregate results")
+    print("metric             mean     std      min      max")
     for key in CORE_METRIC_KEYS:
         item = metrics.get(key)
         if not item:
             continue
         print(f"{key:<18} {item['mean']:.4f}   {item['std']:.4f}   {item['min']:.4f}   {item['max']:.4f}")
-    if "best_fold" in payload:
+    if "best_fold" in payload and should_log(args, "normal"):
         best = payload["best_fold"]
         worst = payload["worst_fold"]
         print("")
-        print(f"Best fold  : subject {best['target_subject']} (raw {best['target_subject_raw']}) | macro_f1={best['macro_f1']:.4f}")
-        print(f"Worst fold : subject {worst['target_subject']} (raw {worst['target_subject_raw']}) | macro_f1={worst['macro_f1']:.4f}")
+        print(f"Best fold  : subject {best['target_subject']} (raw={best['target_subject_raw']}) | macro_f1={best['macro_f1']:.4f}")
+        print(f"Worst fold : subject {worst['target_subject']} (raw={worst['target_subject_raw']}) | macro_f1={worst['macro_f1']:.4f}")
     print("")
     print("Artifacts saved to:")
     print(root)

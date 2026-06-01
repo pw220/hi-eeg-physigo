@@ -83,6 +83,63 @@ class StandardDataset(EEGDataset):
             mapping.setdefault(int(subject_index), _python_scalar(raw_subject))
         return dict(sorted(mapping.items()))
 
+    @property
+    def subject_mapping(self) -> dict[int, Any]:
+        return self.get_subject_mapping()
+
+    @property
+    def subject_table(self):
+        rows = self._subject_rows()
+        try:
+            import pandas as pd
+
+            return pd.DataFrame(rows)
+        except Exception:  # noqa: BLE001 - pandas is optional for lightweight use
+            return rows
+
+    def to_dataframe(self):
+        arrays = self.get_data()
+        rows: dict[str, Any] = {
+            "sample_id": arrays.get("sample_id"),
+            "subject_id": arrays.get("subject_id"),
+            "subject_id_raw": arrays.get("subject_id_raw", arrays.get("subject_id")),
+            "session_id": arrays.get("session_id"),
+        }
+        if "y" in arrays:
+            rows["y"] = arrays["y"]
+        try:
+            import pandas as pd
+
+            return pd.DataFrame({key: value for key, value in rows.items() if value is not None})
+        except Exception:  # noqa: BLE001
+            keys = [key for key, value in rows.items() if value is not None]
+            n_samples = len(arrays["x"])
+            return [
+                {key: _python_scalar(rows[key][idx]) for key in keys}
+                for idx in range(n_samples)
+            ]
+
+    def summary(self) -> None:
+        metadata = self.get_metadata()
+        label_names = metadata.get("label_names") or {0: "alert", 1: "fatigue"}
+        label_items = sorted(label_names.items(), key=lambda item: int(item[0]) if str(item[0]).isdigit() else str(item[0]))
+        class_text = ", ".join(str(name) for _, name in label_items)
+        print("DrowEEG Dataset")
+        print("-" * 15)
+        print(f"Name           : {metadata.get('dataset_name')}")
+        print(f"Samples        : {metadata.get('samples')}")
+        print(f"Subjects       : {len(metadata.get('subjects', []))}")
+        print(f"Input shape    : {metadata.get('input_channels')} channels x {metadata.get('input_samples')} samples")
+        print(f"Classes        : {class_text}")
+        print(f"Label protocol : {metadata.get('label_protocol')}")
+        print("")
+        print("Subject table")
+        table = self.subject_table
+        if hasattr(table, "to_string"):
+            print(table.to_string(index=False))
+        else:
+            print(_format_rows(table))
+
     def get_data(self) -> dict[str, np.ndarray]:
         if self._arrays is None:
             self.load()
@@ -133,6 +190,25 @@ class StandardDataset(EEGDataset):
             "label_names": self._metadata.get("label_names"),
             "metadata": metadata,
         }
+
+    def _subject_rows(self) -> list[dict[str, Any]]:
+        arrays = self.get_data()
+        y = arrays.get("y")
+        rows = []
+        for canonical_id, raw_id in self.get_subject_mapping().items():
+            mask = arrays["subject_id"] == canonical_id
+            row = {
+                "canonical_id": canonical_id,
+                "raw_id": raw_id,
+                "samples": int(mask.sum()),
+            }
+            if y is not None:
+                labels, counts = np.unique(y[mask], return_counts=True)
+                label_counts = {int(label): int(count) for label, count in zip(labels, counts)}
+                row["alert"] = label_counts.get(0, 0)
+                row["fatigue"] = label_counts.get(1, 0)
+            rows.append(row)
+        return rows
 
     def build_fold(self, target_subject: int, validation_mode: str = "subject_split", seed: int = 42, **kwargs) -> EEGFold:
         from droweeg.protocols.splits import build_array_loso_fold
@@ -408,6 +484,21 @@ def _python_scalar(value: Any) -> Any:
     if isinstance(value, bytes):
         return value.decode("utf-8")
     return value
+
+
+def _format_rows(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return ""
+    columns = list(rows[0].keys())
+    widths = [len(column) for column in columns]
+    values = []
+    for row in rows:
+        formatted = [str(row.get(column, "")) for column in columns]
+        widths = [max(width, len(value)) for width, value in zip(widths, formatted, strict=True)]
+        values.append(formatted)
+    lines = [" ".join(column.ljust(width) for column, width in zip(columns, widths, strict=True))]
+    lines.extend(" ".join(value.ljust(width) for value, width in zip(row, widths, strict=True)) for row in values)
+    return "\n".join(lines)
 
 
 def make_toy_dataset(

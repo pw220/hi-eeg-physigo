@@ -16,7 +16,7 @@ print(droweeg.list_models())
 print(droweeg.list_methods())
 
 dataset = droweeg.load_dataset("data/processed/sadt/sadt_unbalanced.npz")
-print(dataset.get_subject_mapping())
+dataset.summary()
 model = droweeg.model("eegnet", dataset=dataset)
 
 results = droweeg.run(
@@ -24,13 +24,14 @@ results = droweeg.run(
     model="eegnet",
     method="source_only",
     protocol="loso",
-    target_subject=1,
+    target_subjects=[1, 3, 5],
+    target_id_space="canonical",
     epochs=50,
     device="cuda",
     validation_mode="none",
-    checkpoint_policy="last",
-    disable_early_stop=True,
+    epoch_log_interval=10,
 )
+results.summary()
 ```
 
 LOSO target selection uses stable fold subject indices. If raw subject IDs are
@@ -53,18 +54,41 @@ results = droweeg.run(
     method="source_only",
     protocol="loso",
     target_subjects=[1, 3, 5],
+    target_id_space="canonical",
     epochs=50,
     device="cuda",
     validation_mode="none",
-    checkpoint_policy="last",
-    disable_early_stop=True,
 )
+```
+
+You can also select by raw subject IDs:
+
+```python
+dataset = droweeg.load_dataset("data/processed/sadt/sadt_unbalanced.npz")
+dataset.summary()
+
+results = droweeg.run(
+    dataset=dataset,
+    model="eegnet",
+    method="source_only",
+    protocol="loso",
+    target_subjects=[1, 22, 35],
+    target_id_space="raw",
+    epochs=50,
+    device="cuda",
+    log_level="normal",
+    epoch_log_interval=10,
+    output_dir="./outputs",
+)
+
+df = results.to_dataframe()
+print(df)
 ```
 
 Console logging is controlled with `log_level` / `--log-level`:
 
 - `quiet`: final aggregate summary and output directory only.
-- `normal`: compact run overview, fold progress, epoch table, fold result, final summary.
+- `normal`: compact run overview, fold progress, epoch table at epoch 1, every `epoch_log_interval` epochs, and final epoch, fold result, final summary.
 - `verbose`: adds split audit and protocol details.
 - `debug`: adds full reproducibility, preprocessing checks, raw commands, and saved paths.
 

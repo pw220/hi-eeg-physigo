@@ -19,6 +19,7 @@ from droweeg.registries import (
     register_method,
     register_model,
 )
+from droweeg.results import DrowEEGResults
 
 register_dataset("seedvig", SeedVIGDataset)
 register_dataset("sadt-balanced", SADTBalancedDataset)
@@ -67,6 +68,7 @@ def run(**kwargs: Any):
 
 __all__ = [
     "Dataset",
+    "DrowEEGResults",
     "EEGDataset",
     "dataset",
     "get_dataset",
