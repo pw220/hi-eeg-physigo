@@ -38,6 +38,7 @@ from data.seedvig_dataset import (
 )
 from data.sadt_dataset import load_sadt_arrays, sadt_counts
 from droweeg.datasets.standard_npz import load_standard_dataset, standard_counts
+from droweeg.protocols import loso as loso_protocol
 from droweeg.registries import get_method, register_builtin_components
 from models.factory import build_model
 from utils.metrics import classification_metrics, entropy_from_probs, softmax
@@ -581,75 +582,11 @@ def existing_checkpoints_for_plan(plan: FoldPlan) -> list[Path]:
 
 
 def plan_seedvig_splits(args: argparse.Namespace, context: DatasetContext, target_subject: int):
-    if context.integrity_report is None:
-        raise ValueError("SEED-VIG planning requires an integrity report")
-    file_pairs = context.file_pairs
-    source_pairs = [(raw, label) for raw, label in file_pairs if parse_subject_id(raw) != target_subject]
-    test_pairs = [(raw, label) for raw, label in file_pairs if parse_subject_id(raw) == target_subject]
-    if args.validation_mode == "subject_split":
-        train_pairs, val_pairs, test_pairs = split_loso_file_pairs(
-            file_pairs,
-            target_subject=target_subject,
-            val_subject_ratio=args.val_subject_ratio,
-            seed=args.seed,
-        )
-        train_counts = counts_for_pairs(train_pairs, context.integrity_report)
-        val_counts = counts_for_pairs(val_pairs, context.integrity_report)
-        train_subject_ids = pair_subjects(train_pairs)
-        val_subject_ids = pair_subjects(val_pairs)
-    elif args.validation_mode == "sample_stratified":
-        if not source_pairs or not test_pairs:
-            raise ValueError("Invalid LOSO split produced an empty source or test partition")
-        train_pairs = source_pairs
-        val_pairs = []
-        source_counts = counts_for_pairs(source_pairs, context.integrity_report)
-        train_counts, val_counts = stratified_metadata_counts(source_counts, args.val_ratio)
-        train_subject_ids = pair_subjects(source_pairs)
-        val_subject_ids = pair_subjects(source_pairs)
-    elif args.validation_mode == "none":
-        if not source_pairs or not test_pairs:
-            raise ValueError("Invalid LOSO split produced an empty source or test partition")
-        train_pairs = source_pairs
-        val_pairs = []
-        train_counts = counts_for_pairs(source_pairs, context.integrity_report)
-        val_counts = zero_counts()
-        train_subject_ids = pair_subjects(source_pairs)
-        val_subject_ids = []
-    else:
-        raise ValueError(f"Unsupported validation mode: {args.validation_mode}")
-    test_counts = counts_for_pairs(test_pairs, context.integrity_report)
-    return train_pairs, val_pairs, test_pairs, train_counts, val_counts, test_counts, train_subject_ids, val_subject_ids
+    return loso_protocol.plan_seedvig_splits(args, context, target_subject)
 
 
 def plan_array_splits(args: argparse.Namespace, context: DatasetContext, target_subject: int):
-    if context.sadt_arrays is None:
-        raise ValueError("Array dataset planning requires loaded arrays")
-    arrays = context.sadt_arrays
-    source = subset_by_subject(arrays, target_subject, include=False)
-    test = subset_by_subject(arrays, target_subject, include=True)
-    if len(test["y"]) == 0:
-        raise ValueError(f"Target subject {target_subject} has no samples")
-    source_subjects = sorted({int(subject) for subject in source["subject_id"]})
-    if args.validation_mode == "subject_split":
-        train_subject_ids, val_subject_ids = split_subject_ids(source_subjects, args.val_subject_ratio, args.seed)
-        train = subset_by_subject_ids(source, train_subject_ids)
-        val = subset_by_subject_ids(source, val_subject_ids)
-        train_counts = array_counts(train, context)
-        val_counts = array_counts(val, context)
-    elif args.validation_mode == "sample_stratified":
-        train, val = split_arrays_stratified(source, val_ratio=args.val_ratio, seed=args.seed)
-        train_subject_ids = source_subjects
-        val_subject_ids = source_subjects
-        train_counts = array_counts(train, context)
-        val_counts = array_counts(val, context)
-    elif args.validation_mode == "none":
-        train_subject_ids = source_subjects
-        val_subject_ids = []
-        train_counts = array_counts(source, context)
-        val_counts = zero_counts()
-    else:
-        raise ValueError(f"Unsupported validation mode: {args.validation_mode}")
-    return train_counts, val_counts, array_counts(test, context), train_subject_ids, val_subject_ids
+    return loso_protocol.plan_array_splits(args, context, target_subject)
 
 
 def array_counts(arrays: dict[str, np.ndarray], context: DatasetContext) -> dict[str, int]:
