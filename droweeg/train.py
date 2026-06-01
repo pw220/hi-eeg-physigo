@@ -29,7 +29,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to a DrowEEG-standard .npz dataset. This is the recommended user-facing dataset input.",
     )
     parser.add_argument("--dataset", choices=("seedvig", "sadt-balanced", "standard-npz"), default="seedvig")
-    parser.add_argument("--model", choices=("eegnet",), default="eegnet")
+    parser.add_argument("--model", default="eegnet")
     parser.add_argument("--method", choices=("source_only",), default="source_only")
     parser.add_argument("--protocol", choices=("loso",), default="loso")
     parser.add_argument("--target-subject", default=None)

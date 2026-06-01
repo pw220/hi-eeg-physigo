@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from torch import nn
 
-from models.eegnet import EEGNet
+from droweeg.registries import get_model, register_builtin_components
 
 
 def build_model(
@@ -12,18 +12,24 @@ def build_model(
     num_classes: int,
     args,
 ) -> nn.Module:
-    if model_name == "eegnet":
-        return EEGNet(
-            channels=channels,
-            samples=samples,
-            num_classes=num_classes,
-            F1=args.eegnet_f1,
-            D=args.eegnet_d,
-            F2=None if args.eegnet_f2 == 0 else args.eegnet_f2,
-            kernLength=args.eegnet_temporal_kernel,
-            separable_kernel_length=args.eegnet_separable_kernel,
-            dropoutRate=args.eegnet_dropout,
-            norm_rate=args.eegnet_norm_rate,
-            log_summary=getattr(args, "log_level", "normal") == "debug",
+    register_builtin_components()
+    model_factory = get_model(model_name)
+    kwargs = {
+        "channels": channels,
+        "samples": samples,
+        "num_classes": num_classes,
+    }
+    if str(model_name).strip().lower() == "eegnet":
+        kwargs.update(
+            {
+                "F1": args.eegnet_f1,
+                "D": args.eegnet_d,
+                "F2": None if args.eegnet_f2 == 0 else args.eegnet_f2,
+                "kernLength": args.eegnet_temporal_kernel,
+                "separable_kernel_length": args.eegnet_separable_kernel,
+                "dropoutRate": args.eegnet_dropout,
+                "norm_rate": args.eegnet_norm_rate,
+                "log_summary": getattr(args, "log_level", "normal") == "debug",
+            }
         )
-    raise ValueError(f"Unsupported model: {model_name}. Supported models: eegnet")
+    return model_factory(**kwargs)

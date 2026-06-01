@@ -125,7 +125,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Source-only EEGNet LOSO baseline on EEG fatigue datasets")
     parser.add_argument("--dataset", choices=("seedvig", "sadt", "standard-npz"), default="seedvig")
     parser.add_argument("--dataset-display-name", default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--model", choices=("eegnet",), default="eegnet")
+    parser.add_argument("--model", default="eegnet")
     parser.add_argument("--data-root", default="data/raw/SEED-VIG")
     parser.add_argument("--raw-data-dir", default=None)
     parser.add_argument("--label-dir", default=None)

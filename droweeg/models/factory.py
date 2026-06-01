@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 
-from droweeg.registries import get_model
+from droweeg.registries import get_model, register_builtin_components
 
 
 def build_model(
@@ -12,6 +12,7 @@ def build_model(
     num_classes: int,
     args: Namespace | None = None,
 ):
+    register_builtin_components()
     model_factory = get_model(model_name)
     kwargs = {
         "channels": input_channels,
@@ -28,6 +29,7 @@ def build_model(
                 "separable_kernel_length": getattr(args, "eegnet_separable_kernel", 16),
                 "dropoutRate": getattr(args, "eegnet_dropout", 0.5),
                 "norm_rate": getattr(args, "eegnet_norm_rate", 0.25),
+                "log_summary": getattr(args, "log_level", "normal") == "debug",
             }
         )
     return model_factory(**kwargs)

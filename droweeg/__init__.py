@@ -3,11 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from droweeg.datasets.base import EEGDataset
-from droweeg.datasets.sadt_balanced import SADTBalancedDataset
-from droweeg.datasets.seedvig import SeedVIGDataset
 from droweeg.datasets.standard_npz import StandardDataset, make_toy_dataset, save_standard_dataset
-from droweeg.methods.source_only import SourceOnlyMethod
-from droweeg.models.eegnet import EEGNet
 from droweeg.registries import (
     get_dataset,
     get_method,
@@ -15,17 +11,14 @@ from droweeg.registries import (
     list_datasets as _registry_list_datasets,
     list_methods,
     list_models,
+    register_builtin_components,
     register_dataset,
     register_method,
     register_model,
 )
 from droweeg.results import DrowEEGResults
 
-register_dataset("seedvig", SeedVIGDataset)
-register_dataset("sadt-balanced", SADTBalancedDataset)
-register_dataset("standard-npz", StandardDataset)
-register_model("eegnet", EEGNet)
-register_method("source_only", SourceOnlyMethod)
+register_builtin_components()
 
 
 def model(name: str, **kwargs):

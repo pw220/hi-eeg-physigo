@@ -6,6 +6,7 @@ from typing import Any, Callable
 DATASET_REGISTRY: dict[str, Callable[..., Any]] = {}
 MODEL_REGISTRY: dict[str, Callable[..., Any]] = {}
 METHOD_REGISTRY: dict[str, Callable[..., Any]] = {}
+_BUILTINS_REGISTERED = False
 
 
 def register_dataset(name: str, cls_or_factory: Callable[..., Any]) -> None:
@@ -42,6 +43,24 @@ def list_models() -> list[str]:
 
 def list_methods() -> list[str]:
     return sorted(METHOD_REGISTRY)
+
+
+def register_builtin_components() -> None:
+    global _BUILTINS_REGISTERED
+    if _BUILTINS_REGISTERED:
+        return
+    from droweeg.datasets.sadt_balanced import SADTBalancedDataset
+    from droweeg.datasets.seedvig import SeedVIGDataset
+    from droweeg.datasets.standard_npz import StandardDataset
+    from droweeg.methods.source_only import SourceOnlyMethod
+    from models.eegnet import EEGNet
+
+    register_dataset("seedvig", SeedVIGDataset)
+    register_dataset("sadt-balanced", SADTBalancedDataset)
+    register_dataset("standard-npz", StandardDataset)
+    register_model("eegnet", EEGNet)
+    register_method("source_only", SourceOnlyMethod)
+    _BUILTINS_REGISTERED = True
 
 
 def _get(registry: dict[str, Callable[..., Any]], name: str, kind: str) -> Callable[..., Any]:
