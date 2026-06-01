@@ -12,7 +12,7 @@ def evaluate_target(model, target_loader_labeled, device):
     receive only unlabeled target loaders before this point.
     """
 
-    from train_eegnet_source import predict_logits
+    from droweeg.engine.sourceonly_backend import predict_logits
 
     logits, y_true = predict_logits(model, target_loader_labeled, device)
     probs = softmax(logits)

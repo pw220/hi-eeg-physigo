@@ -4,9 +4,9 @@ from collections.abc import Sequence
 
 
 def run_backend(argv: Sequence[str] | None = None) -> None:
-    import train_eegnet_source
+    from droweeg.engine import sourceonly_backend
 
-    train_eegnet_source.main(None if argv is None else list(argv))
+    sourceonly_backend.main(None if argv is None else list(argv))
 
 
 def fit_source(*args, **kwargs):
@@ -16,12 +16,12 @@ def fit_source(*args, **kwargs):
     to preserve source-only numbers during Phase 0.
     """
 
-    from train_eegnet_source import train_one_epoch
+    from droweeg.engine.sourceonly_backend import train_one_epoch
 
     return train_one_epoch(*args, **kwargs)
 
 
 def train_one_epoch(*args, **kwargs):
-    from train_eegnet_source import train_one_epoch as _train_one_epoch
+    from droweeg.engine.sourceonly_backend import train_one_epoch as _train_one_epoch
 
     return _train_one_epoch(*args, **kwargs)
