@@ -38,6 +38,7 @@ from data.seedvig_dataset import (
 )
 from data.sadt_dataset import load_sadt_arrays, sadt_counts
 from droweeg.datasets.standard_npz import load_standard_dataset, standard_counts
+from droweeg.engine import checkpointing as engine_checkpointing
 from droweeg.engine import evaluator as engine_evaluator
 from droweeg.protocols import loso as loso_protocol
 from droweeg.registries import get_method, register_builtin_components
@@ -878,19 +879,15 @@ def run_loso_fold(
         print(f"debug_repro initial_parameter_checksum={initial_checksum}")
         print(f"debug_repro first_20_train_sample_ids={first_shuffled_sample_ids(train, args.seed, 20)}")
 
-    best_state = None
-    best_epoch = 0
-    best_monitor = -1.0
-    best_tie = -1.0
-    best_macro_f1 = -1.0
-    best_balanced_acc = -1.0
+    checkpoint_tracker = engine_checkpointing.CheckpointTracker(
+        policy=args.checkpoint_policy,
+        monitor_metric=args.monitor_metric,
+        min_delta=args.min_delta,
+        fixed_eval_epoch=args.fixed_eval_epoch,
+    )
     best_target_diagnostic_auc = -np.inf
     best_target_diagnostic_epoch = 0
     best_target_diagnostic_metrics = None
-    selected_state = None
-    selected_epoch = 0
-    selected_reason = ""
-    epochs_without_improvement = 0
     epoch_rows = []
     if should_log(args, "normal"):
         print_epoch_header(val_loader is not None)
@@ -914,38 +911,14 @@ def run_loso_fold(
             val_pred = val_logits.argmax(axis=1)
             val_metrics = classification_metrics(val_y, val_pred, val_probs[:, 1])
             monitor_value = _monitor_value(val_metrics, args.monitor_metric)
-            tie_metric = "balanced_accuracy" if args.monitor_metric == "macro_f1" else "macro_f1"
-            tie_value = _monitor_value(val_metrics, tie_metric)
-            improved = best_state is None or monitor_value > best_monitor + args.min_delta or (
-                np.isclose(monitor_value, best_monitor) and tie_value > best_tie + args.min_delta
-            )
-            if improved:
-                best_epoch = epoch
-                best_monitor = monitor_value
-                best_tie = tie_value
-                best_macro_f1 = float(val_metrics["macro_f1"])
-                best_balanced_acc = float(val_metrics["balanced_accuracy"])
-                best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-                epochs_without_improvement = 0
-            else:
-                epochs_without_improvement += 1
-        else:
-            epochs_without_improvement = 0
-
-        if args.checkpoint_policy == "last":
-            selected_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-            selected_epoch = epoch
-            selected_reason = "last"
-        elif args.checkpoint_policy == "fixed_epoch" and epoch == args.fixed_eval_epoch:
-            selected_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-            selected_epoch = epoch
-            selected_reason = f"fixed_epoch_{epoch}"
+        checkpoint_tracker.update_validation(epoch=epoch, model=model, val_metrics=val_metrics)
+        checkpoint_tracker.update_selected(epoch=epoch, model=model)
 
         if scheduler is not None and val_metrics is not None:
             scheduler.step(monitor_value)
         current_lr = optimizer.param_groups[0]["lr"]
         epoch_rows.append(epoch_metrics_row(epoch, train_loss, train_metrics, val_metrics, current_lr, monitor_value))
-        print_epoch_row(args, epoch_rows[-1], val_metrics is not None, epochs_without_improvement)
+        print_epoch_row(args, epoch_rows[-1], val_metrics is not None, checkpoint_tracker.epochs_without_improvement)
         if args.test_every_epochs > 0 and epoch % args.test_every_epochs == 0:
             epoch_metrics = evaluate_current_model_on_target(model, test_loader, device)
             test_metrics_history.append(metrics_history_row(epoch, epoch_metrics, reason="interval_diagnostic"))
@@ -956,23 +929,24 @@ def run_loso_fold(
                 best_target_diagnostic_metrics = epoch_metrics
             if should_log(args, "verbose"):
                 print_epoch_test_metrics(plan.target_subject, epoch, epoch_metrics)
-        if early_stop_enabled(args) and epochs_without_improvement >= args.early_stop_patience:
+        if early_stop_enabled(args) and checkpoint_tracker.epochs_without_improvement >= args.early_stop_patience:
             console(
                 args,
                 f"early_stopping_triggered epoch={epoch} "
-                f"best_epoch={best_epoch} monitor_metric={args.monitor_metric} best_monitor={best_monitor:.4f}",
+                f"best_epoch={checkpoint_tracker.best_epoch} monitor_metric={args.monitor_metric} "
+                f"best_monitor={checkpoint_tracker.best_monitor:.4f}",
                 "normal",
             )
             break
 
-    if args.checkpoint_policy == "best_val":
-        if best_state is None:
-            raise RuntimeError("Training did not produce a best validation model")
-        selected_state = best_state
-        selected_epoch = best_epoch
-        selected_reason = f"best_val_{args.monitor_metric}"
-    if selected_state is None:
-        raise RuntimeError(f"Training did not produce a checkpoint for policy={args.checkpoint_policy}")
+    checkpoint_selection = checkpoint_tracker.finalize()
+    selected_state = checkpoint_selection["selected_state"]
+    selected_epoch = int(checkpoint_selection["selected_epoch"])
+    selected_reason = str(checkpoint_selection["selected_reason"])
+    best_epoch = int(checkpoint_selection["best_epoch"])
+    best_monitor = float(checkpoint_selection["best_monitor"])
+    best_macro_f1 = float(checkpoint_selection["best_macro_f1"])
+    best_balanced_acc = float(checkpoint_selection["best_balanced_acc"])
     if args.debug_repro:
         print(f"debug_repro best_epoch={best_epoch} best_validation_metric={best_monitor:.10f}")
         print(f"debug_repro selected_epoch={selected_epoch} selected_reason={selected_reason}")
