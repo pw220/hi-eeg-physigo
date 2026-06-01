@@ -61,6 +61,18 @@ results = droweeg.run(
 )
 ```
 
+Console logging is controlled with `log_level` / `--log-level`:
+
+- `quiet`: final aggregate summary and output directory only.
+- `normal`: compact run overview, fold progress, epoch table, fold result, final summary.
+- `verbose`: adds split audit and protocol details.
+- `debug`: adds full reproducibility, preprocessing checks, raw commands, and saved paths.
+
+Detailed run information is saved under the run directory, including
+`run_config.json`, `reproducibility.json`, `model_selection_policy.json`,
+`split_audit/`, `metrics/`, `predictions/`, `checkpoints/`, and
+`artifacts.json`.
+
 Create a small synthetic example dataset:
 
 ```python

@@ -4,6 +4,7 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import json
 import os
 from pathlib import Path
 import random
@@ -40,6 +41,20 @@ from droweeg.datasets.standard_npz import load_standard_dataset, standard_counts
 from models.factory import build_model
 from utils.metrics import classification_metrics, entropy_from_probs, softmax
 from utils.seed import set_seed
+
+
+LOG_LEVELS = {"quiet": 0, "normal": 1, "verbose": 2, "debug": 3}
+CORE_METRIC_KEYS = ["accuracy", "balanced_accuracy", "macro_f1", "roc_auc", "auprc"]
+DISPLAY_METRIC_KEYS = [
+    "accuracy",
+    "balanced_accuracy",
+    "macro_f1",
+    "fatigue_precision",
+    "fatigue_recall",
+    "specificity",
+    "roc_auc",
+    "auprc",
+]
 
 
 @dataclass(frozen=True)
@@ -176,6 +191,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--debug-repro", action="store_true")
+    parser.add_argument("--log-level", choices=("quiet", "normal", "verbose", "debug"), default="normal")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda", "mps"))
     parser.add_argument("--min-class-samples", type=int, default=1)
     return parser.parse_args(argv)
@@ -195,9 +211,6 @@ def main(argv: list[str] | None = None) -> None:
 
     context = build_dataset_context(args, outputs_dir)
     target_subjects = resolve_target_subjects(args, context.subjects)
-
-    print_global_plan_header(args, context, target_subjects)
-    print_model_selection_policy(args)
     plans = [
         plan_loso_fold(
             args=args,
@@ -207,22 +220,34 @@ def main(argv: list[str] | None = None) -> None:
         )
         for target_subject in target_subjects
     ]
-
-    if args.dry_run:
-        for plan in plans:
-            print_fold_plan(plan, dry_run=True)
-        print_recommended_gpu_command(args)
-        return
-
     device = choose_device(args.device)
     repro_metadata = reproducibility_metadata(args, device)
-    print_reproducibility_metadata(repro_metadata)
-    for plan in plans:
+    write_run_reports(args, context, plans, target_subjects, repro_metadata)
+    if should_log(args, "normal"):
+        print_run_overview(args, context, target_subjects, plans, device)
+    if should_log(args, "debug"):
+        print_global_plan_header(args, context, target_subjects)
+        print_model_selection_policy(args)
+        print_reproducibility_metadata(repro_metadata)
+    elif should_log(args, "verbose"):
+        print_model_selection_policy(args)
+
+    if args.dry_run:
+        for idx, plan in enumerate(plans, start=1):
+            if should_log(args, "verbose"):
+                print_fold_plan(plan, dry_run=True)
+            elif should_log(args, "normal"):
+                print_compact_fold_start(plan, idx, len(plans), dry_run=True)
+        if should_log(args, "debug"):
+            print_recommended_gpu_command(args)
+        return
+
+    for idx, plan in enumerate(plans, start=1):
         if args.skip_existing and plan.outputs_enabled and fold_outputs_exist(plan):
-            print(f"Skipping target_subject={plan.target_subject}: existing prediction CSV and checkpoint found")
+            console(args, f"Skipping target_subject={plan.target_subject}: existing prediction CSV and checkpoint found", "normal")
             continue
         try:
-            run_loso_fold(args, context, plan, device, repro_metadata)
+            run_loso_fold(args, context, plan, device, repro_metadata, fold_index=idx, fold_total=len(plans))
         except Exception as exc:  # noqa: BLE001 - all-LOSO should continue after fold failures
             print(f"Fold target_subject={plan.target_subject} failed: {exc}")
             traceback.print_exc()
@@ -243,7 +268,9 @@ def main(argv: list[str] | None = None) -> None:
             if not args.run_all_loso:
                 raise
 
-    print_recommended_gpu_command(args)
+    print_final_aggregate_summary(args, plans)
+    if should_log(args, "debug"):
+        print_recommended_gpu_command(args)
 
 
 def resolve_target_subjects(args: argparse.Namespace, subjects: list[int]) -> list[int]:
@@ -286,6 +313,15 @@ def parse_target_subjects(raw: str) -> list[int]:
     return values
 
 
+def should_log(args: argparse.Namespace, level: str) -> bool:
+    return LOG_LEVELS[args.log_level] >= LOG_LEVELS[level]
+
+
+def console(args: argparse.Namespace, message: str = "", level: str = "normal") -> None:
+    if should_log(args, level):
+        print(message)
+
+
 def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> DatasetContext:
     if args.dataset == "seedvig":
         reports = {}
@@ -321,12 +357,13 @@ def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> Datase
     if args.dataset == "sadt":
         arrays = load_sadt_arrays(args.sadt_path)
         subjects = sorted({int(subject) for subject in arrays["subject_id"]})
-        print("sadt_dataset_summary")
-        print(f"  path={args.sadt_path}")
-        print(f"  samples={len(arrays['y'])}")
-        print(f"  subjects={subjects}")
-        print("  label_protocol=rt_binary")
-        print("  label_mode_not_applicable=True")
+        if should_log(args, "debug"):
+            print("sadt_dataset_summary")
+            print(f"  path={args.sadt_path}")
+            print(f"  samples={len(arrays['y'])}")
+            print(f"  subjects={subjects}")
+            print("  label_protocol=rt_binary")
+            print("  label_mode_not_applicable=True")
         return DatasetContext(
             dataset=args.dataset_display_name or "sadt",
             model_name=args.model,
@@ -349,14 +386,16 @@ def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> Datase
             raise ValueError(f"standard-npz source-only metrics currently require binary labels {{0, 1}}, got {sorted(labels)}")
         subjects = sorted({int(subject) for subject in arrays["subject_id"]})
         subject_mapping = subject_mapping_from_arrays(arrays)
-        print("standard_npz_dataset_summary")
-        print(f"  path={args.standard_npz_path}")
-        print(f"  samples={len(arrays['y'])}")
-        print(f"  fold_subjects={subjects}")
-        print(f"  subject_mapping={subject_mapping}")
+        if should_log(args, "debug"):
+            print("standard_npz_dataset_summary")
+            print(f"  path={args.standard_npz_path}")
+            print(f"  samples={len(arrays['y'])}")
+            print(f"  fold_subjects={subjects}")
+            print(f"  subject_mapping={subject_mapping}")
         standard_metadata = metadata.get("metadata", {})
         label_protocol = str(standard_metadata.get("protocol_name", "standard"))
-        print(f"  label_protocol={label_protocol}")
+        if should_log(args, "debug"):
+            print(f"  label_protocol={label_protocol}")
         return DatasetContext(
             dataset=args.dataset_display_name or "standard-npz",
             model_name=args.model,
@@ -715,20 +754,32 @@ def run_loso_fold(
     plan: FoldPlan,
     device: torch.device,
     repro_metadata: dict[str, object],
+    *,
+    fold_index: int,
+    fold_total: int,
 ) -> None:
     set_seed(args.seed, deterministic=args.deterministic)
     guard_run_outputs(args, plan)
     write_fold_report(args, context, plan)
-    print_dataset_fold_summary(args, context, plan)
-    print_fold_plan(plan, dry_run=False)
+    if should_log(args, "debug"):
+        print_dataset_fold_summary(args, context, plan)
+        print_fold_plan(plan, dry_run=False)
+    elif should_log(args, "verbose"):
+        print_fold_plan(plan, dry_run=False)
+    elif should_log(args, "normal"):
+        print_compact_fold_start(plan, fold_index, fold_total, dry_run=False)
 
     train, val, test, train_sessions, val_sessions, test_sessions = load_fold_arrays(args, context, plan)
+    fold_audit = initial_fold_audit(args, plan, train, val, test)
     assert plan.target_subject not in set(train["subject_id"])
     if val is not None:
         assert plan.target_subject not in set(val["subject_id"])
 
-    print_source_sanity(train_sessions, val_sessions, context)
-    print_source_split_sanity(train, val)
+    if should_log(args, "debug"):
+        print_source_sanity(train_sessions, val_sessions, context)
+        print_source_split_sanity(train, val)
+    elif should_log(args, "verbose"):
+        print_source_split_sanity(train, val)
     train_x, val_x, preprocess_state = preprocess_source(
         train["x"],
         None if val is None else val["x"],
@@ -737,16 +788,19 @@ def run_loso_fold(
     train["x"] = train_x
     if val is not None:
         val["x"] = val_x
-        print_nan_inf_after_preprocessing(("train", train), ("val", val))
+        if should_log(args, "debug"):
+            print_nan_inf_after_preprocessing(("train", train), ("val", val))
     else:
-        print_nan_inf_after_preprocessing(("train", train))
+        if should_log(args, "debug"):
+            print_nan_inf_after_preprocessing(("train", train))
 
     # Target labels are loaded after source-only preprocessing state is fixed;
     # they are used only for final evaluation and saved prediction diagnostics.
     assert set(test["subject_id"]) == {plan.target_subject}
     test["x"] = preprocess_target(test["x"], preprocess_state)
-    print_target_sanity(test_sessions, test, context)
-    print_nan_inf_after_preprocessing(("test", test))
+    if should_log(args, "debug"):
+        print_target_sanity(test_sessions, test, context)
+        print_nan_inf_after_preprocessing(("test", test))
 
     train_loader = make_loader(
         train,
@@ -773,18 +827,22 @@ def run_loso_fold(
     )
     test_metrics_history = []
     if args.test_every_epochs > 0:
-        print(
+        console(
+            args,
             "target_interval_evaluation=diagnostic_only "
             "target labels are not used for training, checkpoint selection, early stopping, or model selection; "
-            f"final checkpoint still follows checkpoint_policy={args.checkpoint_policy}"
+            f"final checkpoint still follows checkpoint_policy={args.checkpoint_policy}",
+            "verbose",
         )
 
     class_weights = compute_class_weights(train["y"], args.class_balance)
-    print_class_balance(train["y"], args.class_balance, class_weights)
+    if should_log(args, "debug"):
+        print_class_balance(train["y"], args.class_balance, class_weights)
     criterion_weight = None if class_weights is None else torch.tensor(class_weights, dtype=torch.float32, device=device)
 
     model_config = eegnet_model_config(args, context)
-    print_model_and_training_config(args, model_config)
+    if should_log(args, "debug"):
+        print_model_and_training_config(args, model_config)
     set_seed(args.seed, deterministic=args.deterministic)
     model = build_model(args.model, context.input_channels, context.input_samples, context.num_classes, args).to(device)
     optimizer = make_optimizer(model, args)
@@ -808,6 +866,9 @@ def run_loso_fold(
     selected_epoch = 0
     selected_reason = ""
     epochs_without_improvement = 0
+    epoch_rows = []
+    if should_log(args, "normal"):
+        print_epoch_header(val_loader is not None)
     for epoch in range(1, args.epochs + 1):
         train_loss, train_metrics = train_one_epoch(
             model,
@@ -816,6 +877,7 @@ def run_loso_fold(
             criterion,
             device,
             grad_clip_norm=args.grad_clip_norm,
+            show_progress=should_log(args, "debug"),
         )
         if args.debug_repro and epoch == 1:
             print(f"debug_repro epoch1_parameter_checksum={model_parameter_checksum(model)}")
@@ -857,25 +919,8 @@ def run_loso_fold(
         if scheduler is not None and val_metrics is not None:
             scheduler.step(monitor_value)
         current_lr = optimizer.param_groups[0]["lr"]
-        if val_metrics is None:
-            print(
-                f"target_subject={plan.target_subject} epoch={epoch:03d} train_loss={train_loss:.4f} "
-                f"train_roc_auc={format_metric(train_metrics['roc_auc'])} "
-                f"train_macro_f1={format_metric(train_metrics['macro_f1'])} "
-                f"validation_mode=none checkpoint_policy={args.checkpoint_policy} "
-                f"lr={current_lr:.6g}"
-            )
-        else:
-            print(
-                f"target_subject={plan.target_subject} epoch={epoch:03d} train_loss={train_loss:.4f} "
-                f"train_roc_auc={format_metric(train_metrics['roc_auc'])} "
-                f"train_macro_f1={format_metric(train_metrics['macro_f1'])} "
-                f"val_macro_f1={val_metrics['macro_f1']:.4f} "
-                f"val_bal_acc={val_metrics['balanced_accuracy']:.4f} "
-                f"monitor={args.monitor_metric}:{monitor_value:.4f} "
-                f"lr={current_lr:.6g} "
-                f"no_improve={epochs_without_improvement}"
-            )
+        epoch_rows.append(epoch_metrics_row(epoch, train_loss, train_metrics, val_metrics, current_lr, monitor_value))
+        print_epoch_row(args, epoch_rows[-1], val_metrics is not None, epochs_without_improvement)
         if args.test_every_epochs > 0 and epoch % args.test_every_epochs == 0:
             epoch_metrics = evaluate_current_model_on_target(model, test_loader, device)
             test_metrics_history.append(metrics_history_row(epoch, epoch_metrics, reason="interval_diagnostic"))
@@ -884,11 +929,14 @@ def run_loso_fold(
                 best_target_diagnostic_auc = epoch_target_auc
                 best_target_diagnostic_epoch = epoch
                 best_target_diagnostic_metrics = epoch_metrics
-            print_epoch_test_metrics(plan.target_subject, epoch, epoch_metrics)
+            if should_log(args, "verbose"):
+                print_epoch_test_metrics(plan.target_subject, epoch, epoch_metrics)
         if early_stop_enabled(args) and epochs_without_improvement >= args.early_stop_patience:
-            print(
+            console(
+                args,
                 f"early_stopping_triggered epoch={epoch} "
-                f"best_epoch={best_epoch} monitor_metric={args.monitor_metric} best_monitor={best_monitor:.4f}"
+                f"best_epoch={best_epoch} monitor_metric={args.monitor_metric} best_monitor={best_monitor:.4f}",
+                "normal",
             )
             break
 
@@ -904,7 +952,8 @@ def run_loso_fold(
         print(f"debug_repro best_epoch={best_epoch} best_validation_metric={best_monitor:.10f}")
         print(f"debug_repro selected_epoch={selected_epoch} selected_reason={selected_reason}")
     if best_target_diagnostic_metrics is not None:
-        print_best_target_diagnostic_metrics(best_target_diagnostic_epoch, best_target_diagnostic_metrics)
+        if should_log(args, "verbose"):
+            print_best_target_diagnostic_metrics(best_target_diagnostic_epoch, best_target_diagnostic_metrics)
     model.load_state_dict(selected_state)
     if val is not None and plan.outputs_enabled:
         save_validation_subject_metrics(
@@ -921,7 +970,7 @@ def run_loso_fold(
     test_probs = softmax(test_logits)
     test_pred = test_probs.argmax(axis=1)
     test_metrics = classification_metrics(test_y, test_pred, test_probs[:, 1])
-    print_final_metrics(test_metrics)
+    print_fold_result(args, test_metrics)
     has_validation = val_loader is not None
     if test_metrics_history:
         test_metrics_history.append(metrics_history_row(selected_epoch, test_metrics, reason="final_selected_checkpoint"))
@@ -930,6 +979,8 @@ def run_loso_fold(
 
     if plan.outputs_enabled:
         save_predictions(plan.prediction_path, test, test_y, test_pred, test_probs, plan)
+        save_predictions(report_prediction_path(plan), test, test_y, test_pred, test_probs, plan)
+        save_epoch_metrics_report(plan, epoch_rows)
     checkpoint = {
         "run_id": plan.run_id,
         "created_at": plan.created_at,
@@ -1008,17 +1059,36 @@ def run_loso_fold(
             best_val_metric=best_monitor,
             error="",
         )
-        print(f"Saved predictions: {plan.prediction_path}")
-        print(f"Saved checkpoint: {plan.checkpoint_path}")
+        save_fold_reporting(args, plan, test_metrics, selected_epoch, selected_reason)
+        fold_audit.update(
+            {
+                "preprocessing": {
+                    "normalization_source": "source_training_only",
+                    "robust_clipping": bool(args.robust_clip),
+                    "post_preprocess_nan_inf": audit_nan_inf(train=train, val=val, test=test),
+                },
+                "artifacts": fold_artifacts(plan),
+                "selected_epoch": selected_epoch,
+                "selected_reason": selected_reason,
+                "confusion_matrix": np.asarray(test_metrics["confusion_matrix"]).tolist(),
+                "final_metrics": serializable_metrics(test_metrics),
+            }
+        )
+        save_fold_audit(plan, fold_audit)
+        update_aggregate_metrics_report(plan)
+        update_artifacts_report(plan)
+        if should_log(args, "debug"):
+            print(f"Saved predictions: {plan.prediction_path}")
+            print(f"Saved checkpoint: {plan.checkpoint_path}")
         if plan.latest_checkpoint_path is not None:
-            print(f"Saved latest checkpoint: {plan.latest_checkpoint_path}")
-        print(f"Saved summary: {plan.summary_path}")
+            console(args, f"Saved latest checkpoint: {plan.latest_checkpoint_path}", "debug")
+        console(args, f"Saved summary: {plan.summary_path}", "debug")
         if val is not None:
-            print(f"Saved validation metrics: {plan.val_metrics_path}")
+            console(args, f"Saved validation metrics: {plan.val_metrics_path}", "debug")
         if test_metrics_history:
-            print(f"Saved target diagnostic metrics: {plan.test_metrics_path}")
+            console(args, f"Saved target diagnostic metrics: {plan.test_metrics_path}", "debug")
     else:
-        print("Output saving disabled: --output-dir none")
+        console(args, "Output saving disabled: --output-dir none", "debug")
 
 
 def write_fold_report(args: argparse.Namespace, context: DatasetContext, plan: FoldPlan) -> None:
@@ -1186,6 +1256,217 @@ def print_reproducibility_metadata(metadata: dict[str, object]) -> None:
     print("reproducibility")
     for key, value in metadata.items():
         print(f"  {key}={value}")
+
+
+def run_dir(plan: FoldPlan) -> Path:
+    if plan.summary_path.parent.name == "summaries":
+        return plan.summary_path.parent.parent
+    return plan.summary_path.parent
+
+
+def report_prediction_path(plan: FoldPlan) -> Path:
+    return run_dir(plan) / "predictions" / f"fold_{plan.target_subject}.csv"
+
+
+def epoch_metrics_report_path(plan: FoldPlan) -> Path:
+    return run_dir(plan) / "metrics" / f"epoch_metrics_fold_{plan.target_subject}.csv"
+
+
+def fold_metrics_report_path(plan: FoldPlan) -> Path:
+    return run_dir(plan) / "metrics" / "fold_metrics.csv"
+
+
+def aggregate_metrics_report_path(plan: FoldPlan) -> Path:
+    return run_dir(plan) / "metrics" / "aggregate_metrics.json"
+
+
+def split_audit_report_path(plan: FoldPlan) -> Path:
+    return run_dir(plan) / "split_audit" / f"fold_{plan.target_subject}.json"
+
+
+def write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(jsonable(payload), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def jsonable(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, dict):
+        return {str(k): jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(item) for item in value]
+    return value
+
+
+def write_run_reports(
+    args: argparse.Namespace,
+    context: DatasetContext,
+    plans: list[FoldPlan],
+    target_subjects: list[int],
+    repro_metadata: dict[str, object],
+) -> None:
+    if not plans or not outputs_enabled(args):
+        return
+    root = run_dir(plans[0])
+    write_json(
+        root / "run_config.json",
+        {
+            "cli_args": vars(args),
+            "dataset": context.dataset,
+            "model": context.model_name,
+            "label_protocol": context.label_protocol,
+            "input_channels": context.input_channels,
+            "input_samples": context.input_samples,
+            "num_classes": context.num_classes,
+            "subjects": context.subjects,
+            "subject_mapping": context.subject_mapping,
+            "selected_targets": target_subjects,
+            "selected_target_raw_ids": raw_subject_ids(context, target_subjects),
+        },
+    )
+    write_json(root / "reproducibility.json", repro_metadata)
+    write_json(
+        root / "model_selection_policy.json",
+        {
+            "validation_mode": args.validation_mode,
+            "checkpoint_policy": args.checkpoint_policy,
+            "early_stop_enabled": early_stop_enabled(args),
+            "monitor_metric": args.monitor_metric,
+            "target_labels_for_model_selection": False,
+            "normalization_source": "source_training_only",
+            "target_interval_diagnostics": "audit_only" if args.test_every_epochs > 0 else "disabled",
+        },
+    )
+
+
+def print_run_overview(
+    args: argparse.Namespace,
+    context: DatasetContext,
+    target_subjects: list[int],
+    plans: list[FoldPlan],
+    device: torch.device,
+) -> None:
+    output_dir = "none" if not plans else str(run_dir(plans[0])) if outputs_enabled(args) else "none"
+    print("DrowEEG Benchmark Run")
+    print("-" * 21)
+    print(f"Dataset        : {context.dataset}")
+    print("Protocol       : LOSO source-only")
+    print(f"Model          : {'EEGNet' if context.model_name == 'eegnet' else context.model_name}")
+    print(f"Subjects       : {len(context.subjects)} available, {len(target_subjects)} selected")
+    print(f"Input shape    : {context.input_channels} channels x {context.input_samples} samples")
+    print(f"Classes        : {context.num_classes}")
+    print(f"Label protocol : {context.label_protocol}")
+    print(f"Class balance  : {loss_label(args)}")
+    print(f"Validation     : {args.validation_mode}")
+    print(f"Checkpoint     : {checkpoint_label(args)}")
+    print(f"Device         : {device}")
+    print(f"Seed           : {args.seed}")
+    print(f"Output dir     : {output_dir}")
+    print("")
+    print("Protocol checks")
+    print("✓ Target labels are not used for model selection")
+    print("✓ Normalization statistics are computed from source training data only")
+    if args.validation_mode == "none":
+        print(f"! No validation set is used; checkpoint_policy={args.checkpoint_policy} will be used.")
+    if context.dataset != "seedvig":
+        print(f"! label_mode={args.label_mode} was provided but is not applicable to this label protocol.")
+    if not args.run_all_loso and len(target_subjects) < len(context.subjects):
+        print("! Partial LOSO run: only selected target subjects will be evaluated.")
+    print("")
+
+
+def loss_label(args: argparse.Namespace) -> str:
+    if args.loss_type == "weighted_ce" or args.class_balance == "weighted_loss":
+        return "weighted CE"
+    return args.loss_type
+
+
+def checkpoint_label(args: argparse.Namespace) -> str:
+    if args.checkpoint_policy == "last":
+        return "last epoch"
+    if args.checkpoint_policy == "best_val":
+        return f"best validation {args.monitor_metric}"
+    if args.checkpoint_policy == "fixed_epoch":
+        return f"fixed epoch {args.fixed_eval_epoch}"
+    return args.checkpoint_policy
+
+
+def print_compact_fold_start(plan: FoldPlan, fold_index: int, fold_total: int, *, dry_run: bool) -> None:
+    prefix = "Dry-run fold" if dry_run else "Fold"
+    print(f"{prefix} {fold_index}/{fold_total} | target subject: {plan.target_subject} (raw id: {plan.target_subject_raw})")
+    print(
+        f"Train: {plan.train_counts['usable']} samples | "
+        f"alert={plan.train_counts['alert']} | fatigue={plan.train_counts['fatigue']}"
+    )
+    if plan.val_counts["usable"] > 0:
+        print(
+            f"Val  : {plan.val_counts['usable']} samples | "
+            f"alert={plan.val_counts['alert']} | fatigue={plan.val_counts['fatigue']}"
+        )
+    print(
+        f"Test : {plan.test_counts['usable']} samples | "
+        f"alert={plan.test_counts['alert']} | fatigue={plan.test_counts['fatigue']}"
+    )
+    print("")
+
+
+def print_epoch_header(has_validation: bool) -> None:
+    if has_validation:
+        print("Epoch | loss   | train_auc | val_macro_f1 | val_auc | lr       | checkpoint")
+    else:
+        print("Epoch | loss   | train_auc | train_macro_f1 | lr")
+
+
+def epoch_metrics_row(
+    epoch: int,
+    train_loss: float,
+    train_metrics: dict[str, object],
+    val_metrics: dict[str, object] | None,
+    lr: float,
+    monitor_value: float,
+) -> dict[str, object]:
+    row = {
+        "epoch": epoch,
+        "train_loss": train_loss,
+        "train_roc_auc": train_metrics.get("roc_auc"),
+        "train_macro_f1": train_metrics.get("macro_f1"),
+        "lr": lr,
+    }
+    if val_metrics is not None:
+        row.update(
+            {
+                "val_macro_f1": val_metrics.get("macro_f1"),
+                "val_roc_auc": val_metrics.get("roc_auc"),
+                "val_balanced_accuracy": val_metrics.get("balanced_accuracy"),
+                "monitor_value": monitor_value,
+            }
+        )
+    return row
+
+
+def print_epoch_row(args: argparse.Namespace, row: dict[str, object], has_validation: bool, no_improve: int) -> None:
+    if not should_log(args, "normal"):
+        return
+    if has_validation:
+        checkpoint = "hold" if no_improve else "best"
+        print(
+            f"{int(row['epoch']):03d}   | {float(row['train_loss']):.4f} | "
+            f"{format_metric(row['train_roc_auc'])}    | {format_metric(row['val_macro_f1'])}        | "
+            f"{format_metric(row['val_roc_auc'])} | {float(row['lr']):.2e} | {checkpoint}"
+        )
+    else:
+        print(
+            f"{int(row['epoch']):03d}   | {float(row['train_loss']):.4f} | "
+            f"{format_metric(row['train_roc_auc'])}    | {format_metric(row['train_macro_f1'])}         | "
+            f"{float(row['lr']):.2e}"
+        )
 
 
 def get_git_commit_hash() -> str:
@@ -1504,13 +1785,14 @@ def train_one_epoch(
     device: torch.device,
     *,
     grad_clip_norm: float,
+    show_progress: bool = False,
 ) -> tuple[float, dict[str, object]]:
     model.train()
     total_loss = 0.0
     total_count = 0
     logits_list = []
     y_list = []
-    for x, y in tqdm(loader, desc="train", leave=False):
+    for x, y in tqdm(loader, desc="train", leave=False, disable=not show_progress):
         x = x.to(device)
         y = y.to(device)
         optimizer.zero_grad(set_to_none=True)
@@ -1702,6 +1984,214 @@ def serializable_metrics(metrics: dict[str, object]) -> dict[str, object]:
         else:
             out[key] = value
     return out
+
+
+def initial_fold_audit(
+    args: argparse.Namespace,
+    plan: FoldPlan,
+    train: dict[str, np.ndarray],
+    val: dict[str, np.ndarray] | None,
+    test: dict[str, np.ndarray],
+) -> dict[str, object]:
+    return {
+        "target_subject": plan.target_subject,
+        "target_subject_raw": plan.target_subject_raw,
+        "train_subject_ids": plan.train_subject_ids,
+        "train_subject_raw_ids": plan.train_subject_raw_ids,
+        "val_subject_ids": plan.val_subject_ids,
+        "val_subject_raw_ids": plan.val_subject_raw_ids,
+        "test_subject_ids": plan.test_subject_ids,
+        "test_subject_raw_ids": plan.test_subject_raw_ids,
+        "validation_mode": args.validation_mode,
+        "checkpoint_policy": args.checkpoint_policy,
+        "counts": {
+            "train": plan.train_counts,
+            "val": plan.val_counts,
+            "test": plan.test_counts,
+        },
+        "pre_preprocess_nan_inf": audit_nan_inf(train=train, val=val, test=test),
+        "target_labels_for_model_selection": False,
+    }
+
+
+def audit_nan_inf(**named_arrays: dict[str, np.ndarray] | None) -> dict[str, dict[str, int]]:
+    out = {}
+    for name, arrays in named_arrays.items():
+        if arrays is None:
+            continue
+        out[name] = {
+            "nan": int(np.isnan(arrays["x"]).sum()),
+            "inf": int(np.isinf(arrays["x"]).sum()),
+        }
+    return out
+
+
+def save_epoch_metrics_report(plan: FoldPlan, rows: list[dict[str, object]]) -> None:
+    path = epoch_metrics_report_path(plan)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def fold_artifacts(plan: FoldPlan) -> dict[str, str]:
+    return {
+        "prediction_path": str(plan.prediction_path),
+        "standard_prediction_path": str(report_prediction_path(plan)),
+        "checkpoint_path": str(plan.checkpoint_path),
+        "summary_path": str(plan.summary_path),
+        "manifest_path": str(plan.manifest_path),
+        "epoch_metrics_path": str(epoch_metrics_report_path(plan)),
+        "fold_audit_path": str(split_audit_report_path(plan)),
+    }
+
+
+def save_fold_audit(plan: FoldPlan, payload: dict[str, object]) -> None:
+    write_json(split_audit_report_path(plan), payload)
+
+
+def save_fold_reporting(
+    args: argparse.Namespace,
+    plan: FoldPlan,
+    metrics: dict[str, object],
+    selected_epoch: int,
+    selected_reason: str,
+) -> None:
+    path = fold_metrics_report_path(plan)
+    row = {
+        "run_id": plan.run_id,
+        "dataset": plan.dataset,
+        "model": plan.model_name,
+        "label_protocol": plan.label_protocol,
+        "target_subject": plan.target_subject,
+        "target_subject_raw": plan.target_subject_raw,
+        "selected_epoch": selected_epoch,
+        "selected_reason": selected_reason,
+        "validation_mode": args.validation_mode,
+        "checkpoint_policy": args.checkpoint_policy,
+        "test_samples": plan.test_counts["usable"],
+        "alert_count": plan.test_counts["alert"],
+        "fatigue_count": plan.test_counts["fatigue"],
+        **{key: metrics.get(key) for key in DISPLAY_METRIC_KEYS},
+        "tn": metrics.get("tn"),
+        "fp": metrics.get("fp"),
+        "fn": metrics.get("fn"),
+        "tp": metrics.get("tp"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_row = pd.DataFrame([row])
+    if path.exists():
+        df = pd.read_csv(path)
+        df = df.loc[df["target_subject"].astype(str) != str(plan.target_subject)]
+        df = pd.concat([df, new_row], ignore_index=True)
+    else:
+        df = new_row
+    df.sort_values("target_subject", inplace=True)
+    df.to_csv(path, index=False)
+
+
+def update_aggregate_metrics_report(plan: FoldPlan) -> None:
+    fold_path = fold_metrics_report_path(plan)
+    if not fold_path.exists():
+        return
+    df = pd.read_csv(fold_path)
+    metrics = {}
+    for key in CORE_METRIC_KEYS:
+        values = pd.to_numeric(df[key], errors="coerce").dropna()
+        if len(values) == 0:
+            continue
+        metrics[key] = {
+            "mean": float(values.mean()),
+            "std": float(values.std(ddof=0)),
+            "min": float(values.min()),
+            "max": float(values.max()),
+        }
+    payload = {
+        "completed_folds": int(len(df)),
+        "metrics": metrics,
+    }
+    if "macro_f1" in df.columns and len(df):
+        best = df.loc[pd.to_numeric(df["macro_f1"], errors="coerce").idxmax()]
+        worst = df.loc[pd.to_numeric(df["macro_f1"], errors="coerce").idxmin()]
+        payload["best_fold"] = {
+            "target_subject": int(best["target_subject"]),
+            "target_subject_raw": best.get("target_subject_raw"),
+            "macro_f1": float(best["macro_f1"]),
+        }
+        payload["worst_fold"] = {
+            "target_subject": int(worst["target_subject"]),
+            "target_subject_raw": worst.get("target_subject_raw"),
+            "macro_f1": float(worst["macro_f1"]),
+        }
+    write_json(aggregate_metrics_report_path(plan), payload)
+
+
+def update_artifacts_report(plan: FoldPlan) -> None:
+    root = run_dir(plan)
+    write_json(
+        root / "artifacts.json",
+        {
+            "run_dir": root,
+            "run_config": root / "run_config.json",
+            "reproducibility": root / "reproducibility.json",
+            "model_selection_policy": root / "model_selection_policy.json",
+            "split_audit_dir": root / "split_audit",
+            "metrics_dir": root / "metrics",
+            "predictions_dir": root / "predictions",
+            "checkpoints_dir": root / "checkpoints",
+            "summaries_dir": root / "summaries",
+            "reports_dir": root / "reports",
+        },
+    )
+
+
+def print_fold_result(args: argparse.Namespace, metrics: dict[str, object]) -> None:
+    if not should_log(args, "normal"):
+        return
+    print("")
+    print("Fold result")
+    print(format_metrics_inline(metrics, CORE_METRIC_KEYS))
+    print("confusion matrix:")
+    print(np.asarray(metrics["confusion_matrix"], dtype=int).tolist())
+    print("")
+
+
+def format_metrics_inline(metrics: dict[str, object], keys: list[str]) -> str:
+    labels = {
+        "balanced_accuracy": "balanced_acc",
+        "roc_auc": "auc",
+    }
+    return " | ".join(f"{labels.get(key, key)}={format_metric(metrics.get(key, np.nan))}" for key in keys)
+
+
+def print_final_aggregate_summary(args: argparse.Namespace, plans: list[FoldPlan]) -> None:
+    if not plans or not should_log(args, "quiet"):
+        return
+    path = aggregate_metrics_report_path(plans[0])
+    root = run_dir(plans[0])
+    if not path.exists():
+        if should_log(args, "normal"):
+            print(f"Artifacts saved to: {root}")
+        return
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    metrics = payload.get("metrics", {})
+    print("Final LOSO Summary")
+    print("-" * 18)
+    print(f"Completed folds: {payload.get('completed_folds', 0)} / {len(plans)}")
+    print("")
+    print("Metric             mean     std      min      max")
+    for key in CORE_METRIC_KEYS:
+        item = metrics.get(key)
+        if not item:
+            continue
+        print(f"{key:<18} {item['mean']:.4f}   {item['std']:.4f}   {item['min']:.4f}   {item['max']:.4f}")
+    if "best_fold" in payload:
+        best = payload["best_fold"]
+        worst = payload["worst_fold"]
+        print("")
+        print(f"Best fold  : subject {best['target_subject']} (raw {best['target_subject_raw']}) | macro_f1={best['macro_f1']:.4f}")
+        print(f"Worst fold : subject {worst['target_subject']} (raw {worst['target_subject_raw']}) | macro_f1={worst['macro_f1']:.4f}")
+    print("")
+    print("Artifacts saved to:")
+    print(root)
 
 
 def save_success_summary_row(

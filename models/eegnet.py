@@ -58,6 +58,7 @@ class EEGNet(nn.Module):
         separable_kernel_length: int = 16,
         dropoutRate: float = 0.5,
         norm_rate: float = 0.25,
+        log_summary: bool = True,
     ) -> None:
         super().__init__()
         if channels <= 0 or samples <= 0 or num_classes <= 0:
@@ -133,14 +134,15 @@ class EEGNet(nn.Module):
         self.feature_dim = int(feature_dim)
         self.classifier = nn.Linear(self.feature_dim, num_classes)
 
-        print(
-            "EEGNet-8,2 "
-            f"input_shape=(batch, 1, {channels}, {samples}) "
-            f"feature_dim={self.feature_dim} "
-            f"trainable_params={self.count_trainable_parameters()} "
-            f"F1={F1} D={D} F2={F2} kernLength={kernLength} "
-            f"separable_kernel_length={separable_kernel_length} dropoutRate={dropoutRate}"
-        )
+        if log_summary:
+            print(
+                "EEGNet-8,2 "
+                f"input_shape=(batch, 1, {channels}, {samples}) "
+                f"feature_dim={self.feature_dim} "
+                f"trainable_params={self.count_trainable_parameters()} "
+                f"F1={F1} D={D} F2={F2} kernLength={kernLength} "
+                f"separable_kernel_length={separable_kernel_length} dropoutRate={dropoutRate}"
+            )
 
     def _forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = self.temporal_conv(x)

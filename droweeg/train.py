@@ -53,6 +53,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--log-level", choices=("quiet", "normal", "verbose", "debug"), default="normal")
     parser.add_argument("--validation-mode", choices=("subject_split", "sample_stratified", "none"), default="subject_split")
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--val-subject-ratio", type=float, default=0.2)
@@ -146,6 +147,8 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
         str(args.seed),
         "--num-workers",
         str(args.num_workers),
+        "--log-level",
+        args.log_level,
         "--validation-mode",
         args.validation_mode,
         "--val-ratio",

@@ -24,5 +24,6 @@ def build_model(
             separable_kernel_length=args.eegnet_separable_kernel,
             dropoutRate=args.eegnet_dropout,
             norm_rate=args.eegnet_norm_rate,
+            log_summary=getattr(args, "log_level", "normal") == "debug",
         )
     raise ValueError(f"Unsupported model: {model_name}. Supported models: eegnet")
