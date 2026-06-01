@@ -26,6 +26,8 @@ def kwargs_to_argv(kwargs: dict[str, Any]) -> list[str]:
         flag = "--" + key.replace("_", "-")
         if value is True:
             argv.append(flag)
+        elif isinstance(value, (list, tuple)):
+            argv.extend([flag, ",".join(str(item) for item in value)])
         else:
             argv.extend([flag, str(value)])
     return argv

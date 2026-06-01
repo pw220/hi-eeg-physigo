@@ -69,7 +69,13 @@ Then load it:
 ```python
 dataset = droweeg.load_dataset("my_dataset.npz")
 print(dataset.get_metadata())
+print(dataset.get_subject_mapping())
 ```
+
+DrowEEG maps whatever you store in `subjects` to stable 1-based fold indices.
+For example, raw subjects `["a", "b", "d", "f"]` become fold subjects
+`[1, 2, 3, 4]`. Training commands use the fold index, while reports and
+prediction CSVs also keep the original raw subject ID.
 
 For quick examples and API checks, DrowEEG can generate a synthetic toy file:
 
@@ -91,6 +97,21 @@ python -m droweeg.train \
   --epochs 50 \
   --device cuda
 ```
+
+Run selected folds:
+
+```bash
+python -m droweeg.train \
+  --data my_dataset.npz \
+  --model eegnet \
+  --method source_only \
+  --protocol loso \
+  --target-subjects 1,3,4 \
+  --epochs 50 \
+  --device cuda
+```
+
+`--run-all-loso` is mutually exclusive with `--target-subjects`.
 
 Current source-only metrics assume binary labels. Future source-free adaptation workflows may use unlabeled target arrays.
 

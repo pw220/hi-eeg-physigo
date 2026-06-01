@@ -51,12 +51,16 @@ class FoldPlan:
     input_samples: int
     num_classes: int
     target_subject: int
+    target_subject_raw: object
     train_pairs: list[tuple[Path, Path]]
     val_pairs: list[tuple[Path, Path]]
     test_pairs: list[tuple[Path, Path]]
     train_subject_ids: list[int]
     val_subject_ids: list[int]
     test_subject_ids: list[int]
+    train_subject_raw_ids: list[object]
+    val_subject_raw_ids: list[object]
+    test_subject_raw_ids: list[object]
     train_counts: dict[str, int]
     val_counts: dict[str, int]
     test_counts: dict[str, int]
@@ -87,6 +91,7 @@ class DatasetContext:
     input_samples: int
     num_classes: int
     subjects: list[int]
+    subject_mapping: dict[int, object]
     integrity_report: IntegrityReport | None
     file_pairs: list[tuple[Path, Path]]
     sadt_arrays: dict[str, np.ndarray] | None
@@ -103,6 +108,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sadt-path", default="data/processed/sadt/sad-data.mat")
     parser.add_argument("--standard-npz-path", default=None)
     parser.add_argument("--target-subject", type=int, default=1)
+    parser.add_argument(
+        "--target-subjects",
+        default=None,
+        help="Comma-separated 1-based fold subject indices, e.g. 1,2,3. Mutually exclusive with --run-all-loso.",
+    )
     parser.add_argument("--run-all-loso", action="store_true")
     parser.add_argument("--max-folds", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
@@ -237,6 +247,17 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def resolve_target_subjects(args: argparse.Namespace, subjects: list[int]) -> list[int]:
+    if args.run_all_loso and args.target_subjects:
+        raise ValueError(
+            "--run-all-loso cannot be used with --target-subjects. "
+            "Use --run-all-loso for every fold, or --target-subjects for a selected subset."
+        )
+    if args.target_subjects:
+        selected = parse_target_subjects(args.target_subjects)
+        unknown = [subject for subject in selected if subject not in subjects]
+        if unknown:
+            raise ValueError(f"Target subjects {unknown} not found. Available fold subject indices: {subjects}")
+        return selected
     if args.run_all_loso:
         selected = subjects
         if args.max_folds is not None:
@@ -245,8 +266,24 @@ def resolve_target_subjects(args: argparse.Namespace, subjects: list[int]) -> li
             raise ValueError("No target subjects available for --run-all-loso")
         return selected
     if args.target_subject not in subjects:
-        raise ValueError(f"Target subject {args.target_subject} not found. Available: {subjects}")
+        raise ValueError(f"Target subject {args.target_subject} not found. Available fold subject indices: {subjects}")
     return [args.target_subject]
+
+
+def parse_target_subjects(raw: str) -> list[int]:
+    values = []
+    for part in str(raw).replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError as exc:
+            raise ValueError(f"--target-subjects must be comma-separated integers, got: {raw}") from exc
+        if value not in values:
+            values.append(value)
+    if not values:
+        raise ValueError("--target-subjects was provided but no subjects were parsed")
+    return values
 
 
 def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> DatasetContext:
@@ -276,6 +313,7 @@ def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> Datase
             input_samples=1600,
             num_classes=2,
             subjects=subjects,
+            subject_mapping={int(subject): int(subject) for subject in subjects},
             integrity_report=report,
             file_pairs=file_pairs,
             sadt_arrays=None,
@@ -297,6 +335,7 @@ def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> Datase
             input_samples=384,
             num_classes=2,
             subjects=subjects,
+            subject_mapping={int(subject): int(subject) for subject in subjects},
             integrity_report=None,
             file_pairs=[],
             sadt_arrays=arrays,
@@ -309,10 +348,12 @@ def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> Datase
         if not labels.issubset({0, 1}):
             raise ValueError(f"standard-npz source-only metrics currently require binary labels {{0, 1}}, got {sorted(labels)}")
         subjects = sorted({int(subject) for subject in arrays["subject_id"]})
+        subject_mapping = subject_mapping_from_arrays(arrays)
         print("standard_npz_dataset_summary")
         print(f"  path={args.standard_npz_path}")
         print(f"  samples={len(arrays['y'])}")
-        print(f"  subjects={subjects}")
+        print(f"  fold_subjects={subjects}")
+        print(f"  subject_mapping={subject_mapping}")
         standard_metadata = metadata.get("metadata", {})
         label_protocol = str(standard_metadata.get("protocol_name", "standard"))
         print(f"  label_protocol={label_protocol}")
@@ -324,6 +365,7 @@ def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> Datase
             input_samples=int(arrays["x"].shape[2]),
             num_classes=int(max(labels)) + 1,
             subjects=subjects,
+            subject_mapping=subject_mapping,
             integrity_report=None,
             file_pairs=[],
             sadt_arrays=arrays,
@@ -495,6 +537,26 @@ def array_counts(arrays: dict[str, np.ndarray], context: DatasetContext) -> dict
     return standard_counts(arrays)
 
 
+def subject_mapping_from_arrays(arrays: dict[str, np.ndarray]) -> dict[int, object]:
+    raw_subjects = arrays.get("subject_id_raw", arrays["subject_id"])
+    mapping: dict[int, object] = {}
+    for subject_index, raw_subject in zip(arrays["subject_id"], raw_subjects, strict=True):
+        mapping.setdefault(int(subject_index), python_scalar(raw_subject))
+    return dict(sorted(mapping.items()))
+
+
+def raw_subject_ids(context: DatasetContext, subject_ids: list[int]) -> list[object]:
+    return [context.subject_mapping.get(int(subject_id), int(subject_id)) for subject_id in subject_ids]
+
+
+def python_scalar(value: object) -> object:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
 def validation_strategy_text(validation_mode: str) -> str:
     if validation_mode == "subject_split":
         return "deterministic source-subject split controlled by seed and val_subject_ratio"
@@ -615,12 +677,16 @@ def plan_loso_fold(
         input_samples=context.input_samples,
         num_classes=context.num_classes,
         target_subject=target_subject,
+        target_subject_raw=context.subject_mapping.get(int(target_subject), int(target_subject)),
         train_pairs=train_pairs,
         val_pairs=val_pairs,
         test_pairs=test_pairs,
         train_subject_ids=train_subject_ids,
         val_subject_ids=val_subject_ids,
         test_subject_ids=[target_subject],
+        train_subject_raw_ids=raw_subject_ids(context, train_subject_ids),
+        val_subject_raw_ids=raw_subject_ids(context, val_subject_ids),
+        test_subject_raw_ids=raw_subject_ids(context, [target_subject]),
         train_counts=train_counts,
         val_counts=val_counts,
         test_counts=test_counts,
@@ -881,11 +947,14 @@ def run_loso_fold(
         "args": vars(args),
         "label_mode": args.label_mode,
         "target_subject": plan.target_subject,
+        "target_subject_raw": plan.target_subject_raw,
         "seed": args.seed,
         "class_balance": args.class_balance,
         "loss_type": args.loss_type,
         "train_subject_ids": plan.train_subject_ids,
+        "train_subject_raw_ids": plan.train_subject_raw_ids,
         "val_subject_ids": plan.val_subject_ids,
+        "val_subject_raw_ids": plan.val_subject_raw_ids,
         "normalization_mean": torch.from_numpy(preprocess_state["mean"].copy()),
         "normalization_std": torch.from_numpy(preprocess_state["std"].copy()),
         "clipping_thresholds": tensorize_clip_bounds(preprocess_state["clip_bounds"]),
@@ -986,10 +1055,14 @@ def write_fold_report(args: argparse.Namespace, context: DatasetContext, plan: F
         f"Input samples: {context.input_samples}",
         f"Num classes: {context.num_classes}",
         f"Label protocol: {context.label_protocol}",
-        f"Target subject ID: {plan.target_subject}",
+        f"Target fold subject ID: {plan.target_subject}",
+        f"Target raw subject ID: {plan.target_subject_raw}",
         f"Train subject IDs: {plan.train_subject_ids}",
+        f"Train raw subject IDs: {plan.train_subject_raw_ids}",
         f"Validation subject IDs: {plan.val_subject_ids}",
+        f"Validation raw subject IDs: {plan.val_subject_raw_ids}",
         f"Test subject IDs: {plan.test_subject_ids}",
+        f"Test raw subject IDs: {plan.test_subject_raw_ids}",
         f"Validation mode: {args.validation_mode}",
         f"Validation strategy: {plan.validation_strategy}",
         f"Checkpoint policy: {args.checkpoint_policy}",
@@ -1553,6 +1626,7 @@ def save_validation_subject_metrics(
         rows.append(
             {
                 "val_subject": subject_id,
+                "val_subject_raw": first_raw_subject(val, mask),
                 "accuracy": metrics["accuracy"],
                 "balanced_accuracy": metrics["balanced_accuracy"],
                 "macro_f1": metrics["macro_f1"],
@@ -1578,6 +1652,7 @@ def save_predictions(path: Path, arrays: dict[str, np.ndarray], y_true, y_pred, 
             "model": plan.model_name,
             "sample_id": arrays["sample_id"],
             "subject_id": arrays["subject_id"],
+            "subject_id_raw": arrays.get("subject_id_raw", arrays["subject_id"]),
             "session_id": arrays["session_id"],
             "file_name": arrays["file_name"],
             "window_id": arrays["window_id"],
@@ -1594,6 +1669,11 @@ def save_predictions(path: Path, arrays: dict[str, np.ndarray], y_true, y_pred, 
         }
     )
     df.to_csv(path, index=False)
+
+
+def first_raw_subject(arrays: dict[str, np.ndarray], mask: np.ndarray) -> object:
+    raw_subjects = arrays.get("subject_id_raw", arrays["subject_id"])
+    return python_scalar(raw_subjects[np.flatnonzero(mask)[0]])
 
 
 def guard_run_outputs(args: argparse.Namespace, plan: FoldPlan) -> None:
@@ -1734,6 +1814,7 @@ def write_checkpoint_manifest_row(
         "label_protocol": plan.label_protocol,
         "label_mode": args.label_mode,
         "target_subject": plan.target_subject,
+        "target_subject_raw": plan.target_subject_raw,
         "seed": args.seed,
         "class_balance": args.class_balance,
         "loss_type": args.loss_type,
@@ -1853,6 +1934,7 @@ def base_summary_fields(args: argparse.Namespace, plan: FoldPlan) -> dict[str, o
         "num_classes": plan.num_classes,
         "label_protocol": plan.label_protocol,
         "target_subject": plan.target_subject,
+        "target_subject_raw": plan.target_subject_raw,
         "label_mode": args.label_mode,
         "seed": args.seed,
         "class_balance": args.class_balance,
@@ -1875,6 +1957,10 @@ def base_summary_fields(args: argparse.Namespace, plan: FoldPlan) -> dict[str, o
         "val_subject_ratio": args.val_subject_ratio,
         "train_subject_count": len(plan.train_subject_ids),
         "val_subject_count": len(plan.val_subject_ids),
+        "train_subject_ids": plan.train_subject_ids,
+        "train_subject_raw_ids": plan.train_subject_raw_ids,
+        "val_subject_ids": plan.val_subject_ids,
+        "val_subject_raw_ids": plan.val_subject_raw_ids,
         "train_sample_count": plan.train_counts["usable"],
         "val_sample_count": plan.val_counts["usable"],
         "checkpoint_policy": args.checkpoint_policy,
@@ -1986,6 +2072,9 @@ def print_global_plan_header(args: argparse.Namespace, context: DatasetContext, 
     print(f"  max_folds={args.max_folds}")
     print(f"  dry_run={args.dry_run}")
     print(f"  selected_targets={target_subjects}")
+    print(f"  selected_target_raw_ids={raw_subject_ids(context, target_subjects)}")
+    if context.subject_mapping:
+        print(f"  subject_mapping={context.subject_mapping}")
     print(f"  included_subject_count={len(context.subjects)}")
     if context.integrity_report is not None:
         print(f"  included_session_count={len(context.integrity_report.valid_file_pairs)}")
@@ -2032,12 +2121,16 @@ def print_fold_plan(plan: FoldPlan, *, dry_run: bool) -> None:
     print(f"  num_classes={plan.num_classes}")
     print(f"  label_protocol={plan.label_protocol}")
     print(f"  target_subject={plan.target_subject}")
+    print(f"  target_subject_raw={plan.target_subject_raw}")
     print(f"  validation_mode={plan.validation_mode}")
     print(f"  validation_strategy={plan.validation_strategy}")
     print(f"  checkpoint_policy={plan.checkpoint_policy}")
     print(f"  train_subject_ids={plan.train_subject_ids}")
+    print(f"  train_subject_raw_ids={plan.train_subject_raw_ids}")
     print(f"  val_subject_ids={plan.val_subject_ids}")
+    print(f"  val_subject_raw_ids={plan.val_subject_raw_ids}")
     print(f"  test_subject_ids={plan.test_subject_ids}")
+    print(f"  test_subject_raw_ids={plan.test_subject_raw_ids}")
     for name, counts in (("train", plan.train_counts), ("val", plan.val_counts), ("test_audit_only", plan.test_counts)):
         print(
             f"  {name}: sessions={counts['sessions']} usable={counts['usable']} "

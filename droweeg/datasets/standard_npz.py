@@ -75,6 +75,14 @@ class StandardDataset(EEGDataset):
         arrays = self.get_data()
         return sorted({int(subject) for subject in arrays["subject_id"]})
 
+    def get_subject_mapping(self) -> dict[int, Any]:
+        arrays = self.get_data()
+        raw_subjects = arrays.get("subject_id_raw", arrays["subject_id"])
+        mapping: dict[int, Any] = {}
+        for subject_index, raw_subject in zip(arrays["subject_id"], raw_subjects, strict=True):
+            mapping.setdefault(int(subject_index), _python_scalar(raw_subject))
+        return dict(sorted(mapping.items()))
+
     def get_data(self) -> dict[str, np.ndarray]:
         if self._arrays is None:
             self.load()
@@ -99,18 +107,25 @@ class StandardDataset(EEGDataset):
     def get_metadata(self) -> dict[str, Any]:
         arrays = self.get_data()
         metadata = self._metadata.get("metadata", {})
+        dataset_name = metadata.get("dataset_name") or (self.path.stem if self.path is not None else "custom")
+        protocol_name = metadata.get("protocol_name", self.label_protocol)
         label_distribution = {}
         if "y" in arrays and arrays["y"] is not None:
             values, counts = np.unique(arrays["y"], return_counts=True)
             label_distribution = {int(value): int(count) for value, count in zip(values, counts)}
         return {
             **super().get_metadata(),
-            "dataset_name": metadata.get("dataset_name", self.name),
-            "protocol_name": metadata.get("protocol_name"),
+            "name": dataset_name,
+            "loader": self.name,
+            "label_protocol": protocol_name,
+            "dataset_name": dataset_name,
+            "protocol_name": protocol_name,
             "label_mode": metadata.get("label_mode"),
             "path": None if self.path is None else str(self.path),
             "samples": int(len(arrays["x"])),
             "subjects": self.get_subjects(),
+            "raw_subjects": list(self.get_subject_mapping().values()),
+            "subject_mapping": self.get_subject_mapping(),
             "sessions": sorted(str(session) for session in set(arrays["session_id"].tolist())),
             "label_distribution": label_distribution,
             "sfreq": self._metadata.get("sfreq"),
@@ -154,7 +169,7 @@ class StandardDataset(EEGDataset):
             path,
             X=arrays["x"],
             y=arrays.get("y"),
-            subjects=arrays["subject_id"],
+            subjects=arrays.get("subject_id_raw", arrays["subject_id"]),
             sessions=arrays.get("session_id"),
             sample_ids=arrays.get("sample_id"),
             perclos=arrays.get("perclos_value"),
@@ -197,7 +212,8 @@ def standardize_arrays(
     if not np.isfinite(X).all():
         raise ValueError("X contains NaN or Inf")
     n_samples = X.shape[0]
-    subject_id = _as_1d(subjects, "subjects", n_samples).astype(np.int64)
+    subject_id_raw = _as_1d(subjects, "subjects", n_samples).astype(object)
+    subject_id, subject_mapping = _map_subjects_to_indices(subject_id_raw)
     if y is None:
         labels = None
     else:
@@ -224,6 +240,7 @@ def standardize_arrays(
     arrays = {
         "x": X.astype(np.float32, copy=False),
         "subject_id": subject_id,
+        "subject_id_raw": subject_id_raw,
         "sample_id": sample_id,
         "session_id": session_id,
         "file_name": np.asarray(["standard-npz"] * n_samples, dtype=object),
@@ -237,14 +254,14 @@ def standardize_arrays(
         arrays["label"] = labels
     if extra_arrays is not None:
         for key, values in extra_arrays.items():
-            if key in arrays or key in {"X", "subjects", "sessions", "sample_ids", "y"}:
+            if key in arrays or key in {"X", "subjects", "sessions", "sample_ids", "y", "subject_id_raw"}:
                 raise ValueError(f"{key} is reserved and cannot be used as an extra array")
             arrays[key] = _as_1d(values, key, n_samples)
     meta = {
         "sfreq": None if sfreq is None else float(sfreq),
         "channel_names": channel_names,
         "label_names": label_names,
-        "metadata": metadata or {},
+        "metadata": {**(metadata or {}), "subject_mapping": subject_mapping},
     }
     return arrays, meta
 
@@ -279,7 +296,7 @@ def save_standard_dataset(
     )
     payload = {
         "X": arrays["x"],
-        "subjects": arrays["subject_id"],
+        "subjects": arrays.get("subject_id_raw", arrays["subject_id"]),
         "sessions": arrays["session_id"],
         "sample_ids": arrays["sample_id"],
         "perclos": arrays["perclos_value"],
@@ -365,6 +382,34 @@ def standard_counts(arrays: dict[str, np.ndarray]) -> dict[str, int]:
     }
 
 
+def _map_subjects_to_indices(raw_subjects: np.ndarray) -> tuple[np.ndarray, dict[int, Any]]:
+    unique_by_key: dict[tuple[int, str], Any] = {}
+    for value in raw_subjects:
+        unique_by_key.setdefault(_subject_sort_key(value), _python_scalar(value))
+    ordered_items = sorted(unique_by_key.items(), key=lambda item: item[0])
+    key_to_index = {key: index for index, (key, _) in enumerate(ordered_items, start=1)}
+    subject_id = np.asarray([key_to_index[_subject_sort_key(value)] for value in raw_subjects], dtype=np.int64)
+    mapping = {index: raw_value for index, (_, raw_value) in enumerate(ordered_items, start=1)}
+    return subject_id, mapping
+
+
+def _subject_sort_key(value: Any) -> tuple[int, str]:
+    scalar = _python_scalar(value)
+    if isinstance(scalar, (int, np.integer)):
+        return (0, f"{int(scalar):020d}")
+    if isinstance(scalar, (float, np.floating)) and float(scalar).is_integer():
+        return (0, f"{int(scalar):020d}")
+    return (1, str(scalar))
+
+
+def _python_scalar(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
 def make_toy_dataset(
     *,
     n_subjects: int = 4,
@@ -443,6 +488,7 @@ def standard_extra_arrays(arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray
         "file_name",
         "window_id",
         "perclos_value",
+        "subject_id_raw",
         "label_mode",
         "is_valid_binary_sample",
     }

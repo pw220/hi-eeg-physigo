@@ -32,6 +32,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--method", choices=("source_only",), default="source_only")
     parser.add_argument("--protocol", choices=("loso",), default="loso")
     parser.add_argument("--target-subject", type=int, default=1)
+    parser.add_argument("--target-subjects", default=None, help="Comma-separated fold subject indices, e.g. 1,2,3.")
     parser.add_argument("--run-all-loso", action="store_true")
     parser.add_argument("--max-folds", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
@@ -81,6 +82,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> dict[str, Any]:
     args = parse_args(argv)
+    validate_target_selection(args)
     backend_argv = to_backend_argv(args)
     run_backend(backend_argv)
     return build_result(args, backend_argv)
@@ -124,8 +126,6 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
         backend_dataset,
         "--model",
         args.model,
-        "--target-subject",
-        str(args.target_subject),
         "--epochs",
         str(args.epochs),
         "--batch-size",
@@ -196,6 +196,10 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
         argv.extend(["--dataset-display-name", dataset_key])
     if args.run_all_loso:
         argv.append("--run-all-loso")
+    if args.target_subjects is not None:
+        argv.extend(["--target-subjects", target_subjects_to_cli(args.target_subjects)])
+    else:
+        argv.extend(["--target-subject", str(args.target_subject)])
     if args.max_folds is not None:
         argv.extend(["--max-folds", str(args.max_folds)])
     if args.dry_run:
@@ -230,6 +234,7 @@ def build_result(args: argparse.Namespace, backend_argv: list[str]) -> dict[str,
         "protocol": args.protocol,
         "label_protocol": label_protocol,
         "target_subject": args.target_subject,
+        "target_subjects": None if args.target_subjects is None else parse_target_subjects_value(args.target_subjects),
         "run_all_loso": args.run_all_loso,
         "dry_run": args.dry_run,
         "outputs_enabled": outputs_enabled,
@@ -275,6 +280,26 @@ def label_protocol_for_args(args: argparse.Namespace) -> str:
                 if protocol_name:
                     return str(protocol_name)
     return "standard"
+
+
+def validate_target_selection(args: argparse.Namespace) -> None:
+    if args.run_all_loso and args.target_subjects is not None:
+        raise ValueError(
+            "run_all_loso=True cannot be used with target_subjects. "
+            "Use run_all_loso=True for all folds, or target_subjects=[...] for selected folds."
+        )
+
+
+def target_subjects_to_cli(value: object) -> str:
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(item) for item in value)
+    return str(value)
+
+
+def parse_target_subjects_value(value: object) -> list[int]:
+    if isinstance(value, (list, tuple)):
+        return [int(item) for item in value]
+    return [int(part) for part in str(value).replace(" ", "").split(",") if part]
 
 
 def effective_dataset(args: argparse.Namespace) -> str:

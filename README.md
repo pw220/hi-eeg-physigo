@@ -16,6 +16,7 @@ print(droweeg.list_models())
 print(droweeg.list_methods())
 
 dataset = droweeg.load_dataset("data/processed/sadt/sadt_unbalanced.npz")
+print(dataset.get_subject_mapping())
 model = droweeg.model("eegnet", dataset=dataset)
 
 results = droweeg.run(
@@ -24,6 +25,34 @@ results = droweeg.run(
     method="source_only",
     protocol="loso",
     target_subject=1,
+    epochs=50,
+    device="cuda",
+    validation_mode="none",
+    checkpoint_policy="last",
+    disable_early_stop=True,
+)
+```
+
+LOSO target selection uses stable fold subject indices. If raw subject IDs are
+not continuous, DrowEEG maps them to `1..N` and keeps the original IDs in logs,
+summary CSVs, and prediction CSVs.
+
+```python
+dataset = droweeg.load_dataset("my_dataset.npz")
+print(dataset.get_subject_mapping())  # e.g. {1: "a", 2: "b", 3: "d", 4: "f"}
+```
+
+Run one fold with `target_subject=1`, selected folds with
+`target_subjects=[1, 3]`, or every fold with `run_all_loso=True`. Selected
+folds and full LOSO are mutually exclusive.
+
+```python
+results = droweeg.run(
+    data="data/processed/sadt/sadt_unbalanced.npz",
+    model="eegnet",
+    method="source_only",
+    protocol="loso",
+    target_subjects=[1, 3, 5],
     epochs=50,
     device="cuda",
     validation_mode="none",
