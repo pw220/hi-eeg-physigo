@@ -30,8 +30,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dataset", choices=("seedvig", "sadt-balanced", "standard-npz"), default="seedvig")
     parser.add_argument("--model", default="eegnet")
-    parser.add_argument("--method", choices=("source_only",), default="source_only")
+    parser.add_argument("--method", default="source_only")
     parser.add_argument("--protocol", choices=("loso",), default="loso")
+    parser.add_argument("--adaptation-protocol", choices=("none", "transductive", "inductive_split"), default="none")
     parser.add_argument("--target-subject", default=None)
     parser.add_argument("--target-subjects", default=None, help="Comma-separated fold subject indices, e.g. 1,2,3.")
     parser.add_argument("--target-id-space", "--target-subject-id-space", choices=("canonical", "raw"), default="canonical")
@@ -149,6 +150,10 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
         args.class_balance,
         "--loss-type",
         args.loss_type,
+        "--method",
+        args.method,
+        "--adaptation-protocol",
+        args.adaptation_protocol,
         "--seed",
         str(args.seed),
         "--num-workers",
@@ -249,6 +254,7 @@ def build_result(args: argparse.Namespace, backend_argv: list[str]) -> DrowEEGRe
         "model": args.model,
         "method": args.method,
         "protocol": args.protocol,
+        "adaptation_protocol": args.adaptation_protocol,
         "label_protocol": label_protocol,
         "target_subject": args.target_subject,
         "target_subjects": None if args.target_subjects is None else parse_target_subjects_value(args.target_subjects),
@@ -301,6 +307,14 @@ def label_protocol_for_args(args: argparse.Namespace) -> str:
 
 
 def validate_target_selection(args: argparse.Namespace) -> None:
+    from droweeg.registries import get_method, register_builtin_components
+
+    register_builtin_components()
+    get_method(args.method)
+    if args.method != "source_only":
+        raise ValueError("Only method='source_only' is implemented in Phase 0; no SFDA methods are available yet.")
+    if args.adaptation_protocol != "none":
+        raise ValueError("Only adaptation_protocol='none' is implemented in Phase 0.")
     if args.run_all_loso and (args.target_subjects is not None or args.target_subject is not None):
         raise ValueError(
             "run_all_loso=True cannot be used with target_subject or target_subjects. "

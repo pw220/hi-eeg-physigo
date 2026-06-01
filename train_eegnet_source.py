@@ -38,6 +38,7 @@ from data.seedvig_dataset import (
 )
 from data.sadt_dataset import load_sadt_arrays, sadt_counts
 from droweeg.datasets.standard_npz import load_standard_dataset, standard_counts
+from droweeg.registries import get_method, register_builtin_components
 from models.factory import build_model
 from utils.metrics import classification_metrics, entropy_from_probs, softmax
 from utils.seed import set_seed
@@ -126,6 +127,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset", choices=("seedvig", "sadt", "standard-npz"), default="seedvig")
     parser.add_argument("--dataset-display-name", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--model", default="eegnet")
+    parser.add_argument("--method", default="source_only")
+    parser.add_argument("--adaptation-protocol", choices=("none", "transductive", "inductive_split"), default="none")
     parser.add_argument("--data-root", default="data/raw/SEED-VIG")
     parser.add_argument("--raw-data-dir", default=None)
     parser.add_argument("--label-dir", default=None)
@@ -484,6 +487,12 @@ def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> Datase
 
 
 def validate_training_args(args: argparse.Namespace) -> None:
+    register_builtin_components()
+    get_method(args.method)
+    if args.method != "source_only":
+        raise ValueError("Only method='source_only' is implemented in Phase 0; no SFDA methods are available yet.")
+    if args.adaptation_protocol != "none":
+        raise ValueError("Only adaptation_protocol='none' is implemented in Phase 0.")
     if args.epochs <= 0:
         raise ValueError("--epochs must be positive")
     if args.batch_size <= 0:
@@ -729,6 +738,8 @@ def plan_loso_fold(
         "python train_eegnet_source.py "
         f"--dataset {args.dataset} "
         f"--model {args.model} "
+        f"--method {args.method} "
+        f"--adaptation-protocol {args.adaptation_protocol} "
         f"--target-subject {target_subject} "
         f"--epochs {args.epochs} "
         f"--batch-size {args.batch_size} "
@@ -1031,6 +1042,9 @@ def run_loso_fold(
         if should_log(args, "verbose"):
             print_best_target_diagnostic_metrics(best_target_diagnostic_epoch, best_target_diagnostic_metrics)
     model.load_state_dict(selected_state)
+    method = get_method(args.method)()
+    target_unlabeled_loader = make_unlabeled_loader(test, args.batch_size, args.num_workers, args.seed)
+    model = method.adapt(model, target_unlabeled_loader, ctx={"fold": plan, "adaptation_protocol": args.adaptation_protocol})
     if val is not None and plan.outputs_enabled:
         save_validation_subject_metrics(
             model,
@@ -1419,9 +1433,14 @@ def write_run_reports(
         {
             "validation_mode": args.validation_mode,
             "checkpoint_policy": args.checkpoint_policy,
+            "method": args.method,
+            "adaptation_protocol": args.adaptation_protocol,
             "early_stop_enabled": early_stop_enabled(args),
             "monitor_metric": args.monitor_metric,
             "target_labels_for_model_selection": False,
+            "target_labels_used_for_adaptation": False,
+            "target_labels_used_for_model_selection": False,
+            "target_labels_used_for_evaluation_only": True,
             "normalization_source": "source_training_only",
             "target_interval_diagnostics": "audit_only" if args.test_every_epochs > 0 else "disabled",
         },
@@ -1728,6 +1747,26 @@ def make_loader(
         TensorDataset(x, y),
         batch_size=batch_size,
         shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        generator=generator,
+        worker_init_fn=make_seed_worker(seed) if num_workers > 0 else None,
+    )
+
+
+def make_unlabeled_loader(
+    arrays: dict[str, np.ndarray],
+    batch_size: int,
+    num_workers: int,
+    seed: int,
+) -> DataLoader:
+    x = torch.from_numpy(arrays["x"]).float().unsqueeze(1)
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return DataLoader(
+        TensorDataset(x),
+        batch_size=batch_size,
+        shuffle=False,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
         generator=generator,
@@ -2105,6 +2144,13 @@ def initial_fold_audit(
         },
         "pre_preprocess_nan_inf": audit_nan_inf(train=train, val=val, test=test),
         "target_labels_for_model_selection": False,
+        "adaptation_protocol": args.adaptation_protocol,
+        "target_unlabeled_used_for_adaptation": False,
+        "target_bn_stats_recomputed_on_target": False,
+        "target_labels_used_for_adaptation": False,
+        "target_labels_used_for_model_selection": False,
+        "target_labels_used_for_evaluation_only": True,
+        "adaptation_eval_split": "n/a",
     }
 
 

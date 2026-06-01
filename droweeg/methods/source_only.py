@@ -1,26 +1,29 @@
 from __future__ import annotations
 
-from .base import Method
+from torch import nn
+
+from .base import BaseMethod
 
 
-class SourceOnlyMethod(Method):
-    """Source-only baseline wrapper.
+class SourceOnlyMethod(BaseMethod):
+    """Source-only method plug-in.
 
-    This method delegates to the current source-only trainer. It does not use
-    target labels for training, validation, normalization, clipping, class
-    weighting, checkpoint selection, or model selection.
+    Source-only does not adapt on target data. The method boundary is still
+    exercised so future SFDA methods can plug in at the same point without
+    owning source training, checkpointing, or target-label evaluation.
     """
 
     name = "source_only"
 
-    def fit_source(self, *args, **kwargs):
-        raise RuntimeError("Use droweeg.run(...) or python -m droweeg.train for this compatibility wrapper.")
+    def adapt(self, model: nn.Module, target_loader_unlabeled, *, ctx) -> nn.Module:
+        return model
 
-    def adapt_target(self, *args, **kwargs):
-        return None
+    def diagnostics(self) -> dict:
+        return {
+            "target_unlabeled_used_for_adaptation": False,
+            "target_bn_stats_recomputed_on_target": False,
+            "target_labels_used_for_adaptation": False,
+        }
 
-    def evaluate(self, *args, **kwargs):
-        raise RuntimeError("Use droweeg.run(...) or python -m droweeg.train for this compatibility wrapper.")
 
-    def save_outputs(self, *args, **kwargs):
-        raise RuntimeError("Use droweeg.run(...) or python -m droweeg.train for this compatibility wrapper.")
+SourceOnly = SourceOnlyMethod
