@@ -38,6 +38,7 @@ from data.seedvig_dataset import (
 )
 from data.sadt_dataset import load_sadt_arrays, sadt_counts
 from droweeg.datasets.standard_npz import load_standard_dataset, standard_counts
+from droweeg.engine import evaluator as engine_evaluator
 from droweeg.protocols import loso as loso_protocol
 from droweeg.registries import get_method, register_builtin_components
 from models.factory import build_model
@@ -993,10 +994,11 @@ def run_loso_fold(
             args.seed,
         )
 
-    test_logits, test_y = predict_logits(model, test_loader, device)
-    test_probs = softmax(test_logits)
-    test_pred = test_probs.argmax(axis=1)
-    test_metrics = classification_metrics(test_y, test_pred, test_probs[:, 1])
+    target_eval = engine_evaluator.evaluate_target(model, test_loader, device)
+    test_y = target_eval["y_true"]
+    test_probs = target_eval["probs"]
+    test_pred = target_eval["y_pred"]
+    test_metrics = target_eval["metrics"]
     print_fold_result(args, test_metrics, plan)
     has_validation = val_loader is not None
     if test_metrics_history:
@@ -1915,10 +1917,7 @@ def predict_logits(model, loader, device: torch.device) -> tuple[np.ndarray, np.
 
 
 def evaluate_current_model_on_target(model, loader, device: torch.device) -> dict[str, object]:
-    logits, y_true = predict_logits(model, loader, device)
-    probs = softmax(logits)
-    y_pred = probs.argmax(axis=1)
-    return classification_metrics(y_true, y_pred, probs[:, 1])
+    return engine_evaluator.evaluate_target_metrics(model, loader, device)
 
 
 def metrics_history_row(epoch: int, metrics: dict[str, object], *, reason: str) -> dict[str, object]:
