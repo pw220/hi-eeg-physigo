@@ -32,10 +32,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", choices=("eegnet",), default="eegnet")
     parser.add_argument("--method", choices=("source_only",), default="source_only")
     parser.add_argument("--protocol", choices=("loso",), default="loso")
-    parser.add_argument("--target-subject", default="1")
+    parser.add_argument("--target-subject", default=None)
     parser.add_argument("--target-subjects", default=None, help="Comma-separated fold subject indices, e.g. 1,2,3.")
     parser.add_argument("--target-id-space", "--target-subject-id-space", choices=("canonical", "raw"), default="canonical")
-    parser.add_argument("--run-all-loso", action="store_true")
+    parser.add_argument("--run-all-loso", action="store_true", default=None)
+    parser.add_argument("--no-run-all-loso", action="store_false", dest="run_all_loso", help=argparse.SUPPRESS)
     parser.add_argument("--max-folds", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--raw-data-dir", default=None)
@@ -206,12 +207,15 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
             argv.extend(["--label-mode", args.label_mode])
     if args.checkpoint_policy is not None:
         argv.extend(["--checkpoint-policy", args.checkpoint_policy])
-    if args.run_all_loso:
+    run_all_loso = effective_run_all_loso(args)
+    if run_all_loso:
         argv.append("--run-all-loso")
-    if args.target_subjects is not None:
+    elif args.target_subjects is not None:
         argv.extend(["--target-subjects", target_subjects_to_cli(args.target_subjects)])
-    else:
+    elif args.target_subject is not None:
         argv.extend(["--target-subject", str(args.target_subject)])
+    else:
+        argv.extend(["--target-subject", "1"])
     argv.extend(["--target-id-space", args.target_id_space])
     if args.max_folds is not None:
         argv.extend(["--max-folds", str(args.max_folds)])
@@ -249,7 +253,7 @@ def build_result(args: argparse.Namespace, backend_argv: list[str]) -> DrowEEGRe
         "target_subject": args.target_subject,
         "target_subjects": None if args.target_subjects is None else parse_target_subjects_value(args.target_subjects),
         "target_id_space": args.target_id_space,
-        "run_all_loso": args.run_all_loso,
+        "run_all_loso": effective_run_all_loso(args),
         "dry_run": args.dry_run,
         "outputs_enabled": outputs_enabled,
         "output_dir": None if not outputs_enabled else output_dir,
@@ -297,11 +301,17 @@ def label_protocol_for_args(args: argparse.Namespace) -> str:
 
 
 def validate_target_selection(args: argparse.Namespace) -> None:
-    if args.run_all_loso and args.target_subjects is not None:
+    if args.run_all_loso and (args.target_subjects is not None or args.target_subject is not None):
         raise ValueError(
-            "run_all_loso=True cannot be used with target_subjects. "
-            "Use run_all_loso=True for all folds, or target_subjects=[...] for selected folds."
+            "run_all_loso=True cannot be used with target_subject or target_subjects. "
+            "Omit targets for all folds, or pass target_subject/target_subjects for selected folds."
         )
+
+
+def effective_run_all_loso(args: argparse.Namespace) -> bool:
+    if args.run_all_loso is not None:
+        return bool(args.run_all_loso)
+    return args.target_subject is None and args.target_subjects is None
 
 
 def target_subjects_to_cli(value: object) -> str:
