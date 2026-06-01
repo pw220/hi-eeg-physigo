@@ -1028,7 +1028,7 @@ def print_dataset_fold_summary(args: argparse.Namespace, context: DatasetContext
     print(f"  num_classes={context.num_classes}")
     print(f"  label_protocol={context.label_protocol}")
     if context.dataset != "seedvig":
-        print(f"  label_mode={args.label_mode} ignored_for_sadt=True")
+        print(f"  label_mode={args.label_mode} label_mode_applicable=False")
     print(f"  normalization_stats=source_training_only")
 
 
@@ -2277,7 +2277,7 @@ def print_recommended_gpu_command(args: argparse.Namespace) -> None:
         return
     if args.dataset == "standard-npz":
         print(
-            "python -m droweeg.train --dataset standard-npz --path my_dataset.npz "
+            "python -m droweeg.train --data my_dataset.npz "
             "--model eegnet --method source_only --protocol loso --run-all-loso --epochs 50 "
             "--batch-size 64 --device cuda --validation-mode none --checkpoint-policy last"
         )

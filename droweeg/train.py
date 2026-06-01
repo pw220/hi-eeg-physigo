@@ -22,6 +22,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description="DrowEEG training CLI")
     parser.add_argument("--config", default=None)
+    parser.add_argument(
+        "--data",
+        default=None,
+        help="Path to a DrowEEG-standard .npz dataset. This is the recommended user-facing dataset input.",
+    )
     parser.add_argument("--dataset", choices=("seedvig", "sadt-balanced", "standard-npz"), default="seedvig")
     parser.add_argument("--model", choices=("eegnet",), default="eegnet")
     parser.add_argument("--method", choices=("source_only",), default="source_only")
@@ -32,7 +37,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--raw-data-dir", default=None)
     parser.add_argument("--label-dir", default=None)
-    parser.add_argument("--sadt-balanced-path", default="data/processed/sadt/sad-data.mat")
+    parser.add_argument("--sadt-balanced-path", default="data/processed/sadt/sad-balance.mat")
     parser.add_argument("--path", default=None, help="Dataset path alias, mainly for --dataset standard-npz.")
     parser.add_argument("--standard-npz-path", default=None)
     parser.add_argument("--label-mode", choices=("threshold35", "strict035070"), default="threshold35")
@@ -82,6 +87,11 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
 
 
 def run_from_kwargs(**kwargs) -> dict[str, Any]:
+    if kwargs.get("data") is not None:
+        kwargs = dict(kwargs)
+        kwargs.setdefault("dataset", "standard-npz")
+        kwargs.setdefault("standard_npz_path", kwargs["data"])
+        return main(kwargs_to_argv(kwargs))
     dataset_obj = kwargs.get("dataset")
     if isinstance(dataset_obj, EEGDataset):
         kwargs = dict(kwargs)
@@ -99,14 +109,16 @@ def run_from_kwargs(**kwargs) -> dict[str, Any]:
 
 
 def to_backend_argv(args: argparse.Namespace) -> list[str]:
-    if args.dataset == "seedvig":
+    dataset_name = effective_dataset(args)
+    if dataset_name == "seedvig":
         label_protocol = args.label_mode
-    elif args.dataset == "sadt-balanced":
+    elif dataset_name == "sadt-balanced":
         label_protocol = "rt_binary"
     else:
-        label_protocol = "standard"
-    output_dir = _resolve_output_dir(args.output_dir, args.dataset, args.model, args.method, label_protocol)
-    backend_dataset = {"seedvig": "seedvig", "sadt-balanced": "sadt", "standard-npz": "standard-npz"}[args.dataset]
+        label_protocol = label_protocol_for_args(args)
+    dataset_key = dataset_key_for_args(args)
+    output_dir = _resolve_output_dir(args.output_dir, dataset_key, args.model, args.method, label_protocol)
+    backend_dataset = {"seedvig": "seedvig", "sadt-balanced": "sadt", "standard-npz": "standard-npz"}[dataset_name]
     argv = [
         "--dataset",
         backend_dataset,
@@ -167,21 +179,21 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
         "--eegnet-norm-rate",
         str(args.eegnet_norm_rate),
     ]
-    if args.dataset == "seedvig":
+    if dataset_name == "seedvig":
         argv.extend(["--label-mode", args.label_mode])
         if args.raw_data_dir is not None:
             argv.extend(["--raw-data-dir", str(args.raw_data_dir)])
         if args.label_dir is not None:
             argv.extend(["--label-dir", str(args.label_dir)])
-    elif args.dataset == "sadt-balanced":
+    elif dataset_name == "sadt-balanced":
         argv.extend(["--sadt-path", str(args.sadt_balanced_path)])
         argv.extend(["--dataset-display-name", "sadt-balanced"])
     else:
-        standard_npz_path = args.standard_npz_path or args.path
+        standard_npz_path = standard_npz_path_for_args(args)
         if standard_npz_path is None:
-            raise ValueError("--dataset standard-npz requires --standard-npz-path or --path")
+            raise ValueError("Standard dataset training requires --data, --standard-npz-path, or --path")
         argv.extend(["--standard-npz-path", str(standard_npz_path)])
-        argv.extend(["--dataset-display-name", "standard-npz"])
+        argv.extend(["--dataset-display-name", dataset_key])
     if args.run_all_loso:
         argv.append("--run-all-loso")
     if args.max_folds is not None:
@@ -203,12 +215,16 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
 
 def build_result(args: argparse.Namespace, backend_argv: list[str]) -> dict[str, Any]:
     label_protocol = label_protocol_for_args(args)
-    output_dir = _resolve_output_dir(args.output_dir, args.dataset, args.model, args.method, label_protocol)
+    dataset_name = effective_dataset(args)
+    dataset_key = dataset_key_for_args(args)
+    output_dir = _resolve_output_dir(args.output_dir, dataset_key, args.model, args.method, label_protocol)
     outputs_enabled = output_dir.strip().lower() not in {"none", "null", "off", "false"}
     result: dict[str, Any] = {
         "status": "completed",
         "backend_args": backend_argv,
-        "dataset": args.dataset,
+        "dataset": dataset_key,
+        "dataset_backend": dataset_name,
+        "data": standard_npz_path_for_args(args),
         "model": args.model,
         "method": args.method,
         "protocol": args.protocol,
@@ -223,7 +239,7 @@ def build_result(args: argparse.Namespace, backend_argv: list[str]) -> dict[str,
         return result
 
     root = Path(output_dir)
-    stem = f"{args.dataset}_{args.model}_{args.method}_{label_protocol}"
+    stem = f"{dataset_key}_{args.model}_{args.method}_{label_protocol}"
     paths = {
         "predictions_dir": root / "predictions",
         "checkpoints_dir": root / "checkpoints",
@@ -245,11 +261,12 @@ def build_result(args: argparse.Namespace, backend_argv: list[str]) -> dict[str,
 
 
 def label_protocol_for_args(args: argparse.Namespace) -> str:
-    if args.dataset == "seedvig":
+    dataset_name = effective_dataset(args)
+    if dataset_name == "seedvig":
         return args.label_mode
-    if args.dataset == "sadt-balanced":
+    if dataset_name == "sadt-balanced":
         return "rt_binary"
-    standard_npz_path = args.standard_npz_path or args.path
+    standard_npz_path = standard_npz_path_for_args(args)
     if standard_npz_path is not None and Path(standard_npz_path).exists():
         with np.load(standard_npz_path, allow_pickle=True) as data:
             if "metadata_json" in data:
@@ -258,6 +275,36 @@ def label_protocol_for_args(args: argparse.Namespace) -> str:
                 if protocol_name:
                     return str(protocol_name)
     return "standard"
+
+
+def effective_dataset(args: argparse.Namespace) -> str:
+    return "standard-npz" if getattr(args, "data", None) is not None else args.dataset
+
+
+def standard_npz_path_for_args(args: argparse.Namespace) -> str | None:
+    return getattr(args, "data", None) or args.standard_npz_path or args.path
+
+
+def dataset_key_for_args(args: argparse.Namespace) -> str:
+    dataset_name = effective_dataset(args)
+    if dataset_name != "standard-npz":
+        return dataset_name
+    standard_npz_path = standard_npz_path_for_args(args)
+    if standard_npz_path is None:
+        return "standard"
+    path = Path(standard_npz_path)
+    dataset_name_from_metadata = None
+    if path.exists():
+        with np.load(path, allow_pickle=True) as data:
+            if "metadata_json" in data:
+                metadata = json.loads(str(np.asarray(data["metadata_json"]).item()))
+                dataset_name_from_metadata = metadata.get("dataset_name")
+    return _safe_name(str(dataset_name_from_metadata or path.stem))
+
+
+def _safe_name(value: str) -> str:
+    cleaned = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in value.strip())
+    return cleaned.strip("_") or "dataset"
 
 
 def _resolve_output_dir(output_dir: str, dataset: str, model: str, method: str, label_protocol: str) -> str:

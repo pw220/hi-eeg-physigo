@@ -67,16 +67,23 @@ droweeg.save_standard_dataset(
 Then load it:
 
 ```python
-dataset = droweeg.dataset("standard-npz", path="my_dataset.npz")
+dataset = droweeg.load_dataset("my_dataset.npz")
 print(dataset.get_metadata())
+```
+
+For quick examples and API checks, DrowEEG can generate a synthetic toy file:
+
+```python
+toy = droweeg.make_toy_dataset(n_subjects=4, samples_per_subject=20)
+toy.save("toy_droweeg.npz")
+print(droweeg.load_dataset("toy_droweeg.npz").get_metadata())
 ```
 
 ## Train With Standard NPZ
 
 ```bash
 python -m droweeg.train \
-  --dataset standard-npz \
-  --path my_dataset.npz \
+  --data my_dataset.npz \
   --model eegnet \
   --method source_only \
   --protocol loso \
@@ -89,11 +96,14 @@ Current source-only metrics assume binary labels. Future source-free adaptation 
 
 ## Official Adapters
 
-Official adapters such as `seedvig` and `sadt-balanced` convert known public dataset layouts into this same standard representation:
+Official adapters such as `seedvig` and `sadt-balanced` convert known public
+dataset layouts into this same standard representation. They are intended for
+conversion and compatibility, not as the main user-facing API:
 
 ```python
-sadt = droweeg.dataset("sadt-balanced", path="data/processed/sadt/sad-data.mat")
+sadt = droweeg.dataset("sadt-balanced", path="data/processed/sadt/sad-balance.mat")
 standard = sadt.to_standard_dataset()
+standard.save("data/processed/sadt/sadt_balanced.npz")
 print(standard.get_metadata())
 ```
 

@@ -35,8 +35,8 @@ python train_eegnet_source.py \
   --label-dir /content/drive/MyDrive/SEED-VIG/perclos_labels
 ```
 
-Processed local datasets are also ignored by Git. The current cleaned local
-layout keeps only the four reusable datasets used by DrowEEG:
+Processed local datasets are also ignored by Git. The current recommended
+DrowEEG-standard files are:
 
 ```text
 data/processed/
@@ -44,9 +44,12 @@ data/processed/
 │   ├── seedvig_8s_threshold35_min50_all_sessions.npz
 │   └── seedvig_8s_strict035070_min50_one_session.npz
 └── sadt/
-    ├── sad-data.mat
-    └── sadt_rt_icnn_compatible_unbalanced.npz
+    ├── sadt_balanced.npz
+    └── sadt_unbalanced.npz
 ```
 
 Do not commit these files. In Colab, place equivalent files under a private
 Drive folder such as `/content/drive/MyDrive/EEG-Data/processed/`.
+
+Source conversion files such as `sad-balance.mat` may exist locally, but the
+package-facing training input should be the converted `.npz` file.

@@ -19,7 +19,7 @@ class SADTBalancedDataset(EEGDataset):
     input_samples = 384
     num_classes = 2
 
-    def __init__(self, path: str | Path = "data/processed/sadt/sad-data.mat", **_: object) -> None:
+    def __init__(self, path: str | Path = "data/processed/sadt/sad-balance.mat", **_: object) -> None:
         self.path = Path(path)
         self._arrays: dict[str, np.ndarray] | None = None
 
@@ -59,9 +59,13 @@ class SADTBalancedDataset(EEGDataset):
             sfreq=128,
             label_names={0: "alert", 1: "fatigue"},
             metadata={
+                "dataset_name": "sadt-balanced",
+                "protocol_name": "rt_binary_balanced",
                 "source_dataset": self.name,
                 "source_path": str(self.path),
                 "description": "Converted from processed balanced SADT mini dataset.",
+                "normalization": "not_applied_in_cache",
+                "robust_clipping": "not_applied_in_cache",
             },
         )
 

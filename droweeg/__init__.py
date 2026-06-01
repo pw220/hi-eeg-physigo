@@ -5,14 +5,14 @@ from typing import Any
 from droweeg.datasets.base import EEGDataset
 from droweeg.datasets.sadt_balanced import SADTBalancedDataset
 from droweeg.datasets.seedvig import SeedVIGDataset
-from droweeg.datasets.standard_npz import StandardDataset, save_standard_dataset
+from droweeg.datasets.standard_npz import StandardDataset, make_toy_dataset, save_standard_dataset
 from droweeg.methods.source_only import SourceOnlyMethod
 from droweeg.models.eegnet import EEGNet
 from droweeg.registries import (
     get_dataset,
     get_method,
     get_model,
-    list_datasets,
+    list_datasets as _registry_list_datasets,
     list_methods,
     list_models,
     register_dataset,
@@ -28,6 +28,9 @@ register_method("source_only", SourceOnlyMethod)
 
 
 def model(name: str, **kwargs):
+    data_path = kwargs.pop("data", None)
+    if data_path is not None and "dataset" not in kwargs:
+        kwargs["dataset"] = load_dataset(data_path)
     dataset_obj = kwargs.pop("dataset", None)
     if dataset_obj is not None:
         metadata = dataset_obj.get_metadata()
@@ -39,6 +42,17 @@ def model(name: str, **kwargs):
 
 def dataset(name: str, **kwargs):
     return get_dataset(name)(**kwargs)
+
+
+def list_datasets(*, include_internal: bool = False) -> list[str]:
+    names = _registry_list_datasets()
+    if include_internal:
+        return names
+    return [name for name in names if name != "standard-npz"]
+
+
+def load_dataset(path: str, **kwargs):
+    return StandardDataset(path=path, **kwargs).load()
 
 
 def method(name: str, **kwargs):
@@ -61,6 +75,8 @@ __all__ = [
     "list_datasets",
     "list_methods",
     "list_models",
+    "load_dataset",
+    "make_toy_dataset",
     "method",
     "model",
     "register_dataset",
@@ -71,4 +87,4 @@ __all__ = [
 ]
 
 
-Dataset = EEGDataset
+Dataset = StandardDataset

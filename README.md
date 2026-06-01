@@ -6,48 +6,61 @@ No TRACE, SFDA, Riemannian reference, pseudo-labeling, entropy minimization, or 
 
 ## Package API
 
-The recommended new interface is:
+The recommended interface is path-based: users preprocess data once into a
+DrowEEG-standard `.npz`, then pass that file to DrowEEG.
 
 ```python
 import droweeg
 
-print(droweeg.list_datasets())
 print(droweeg.list_models())
 print(droweeg.list_methods())
 
-model = droweeg.model("eegnet", channels=17, samples=1600, num_classes=2)
-dataset = droweeg.dataset("sadt-balanced", path="data/processed/sadt/sad-data.mat")
+dataset = droweeg.load_dataset("data/processed/sadt/sadt_unbalanced.npz")
+model = droweeg.model("eegnet", dataset=dataset)
 
 results = droweeg.run(
-    dataset="sadt-balanced",
+    data="data/processed/sadt/sadt_unbalanced.npz",
     model="eegnet",
     method="source_only",
     protocol="loso",
-    sadt_balanced_path="data/processed/sadt/sad-data.mat",
-    run_all_loso=True,
+    target_subject=1,
     epochs=50,
     device="cuda",
+    validation_mode="none",
+    checkpoint_policy="last",
+    disable_early_stop=True,
 )
 ```
 
-Current registries:
+Create a small synthetic example dataset:
 
-- datasets: `seedvig`, `sadt-balanced`, `standard-npz`
+```python
+toy = droweeg.make_toy_dataset(n_subjects=4, samples_per_subject=20)
+toy.save("toy_droweeg.npz")
+print(droweeg.load_dataset("toy_droweeg.npz").get_metadata())
+```
+
+Current public model/method names:
+
 - models: `eegnet`
 - methods: `source_only`
 
-Advanced users can register custom components with `droweeg.register_model(...)`, `droweeg.register_dataset(...)`, and `droweeg.register_method(...)`. See `docs/custom_model.md`.
+Official adapters such as `seedvig` and `sadt-balanced` are provided for
+conversion and backward compatibility, but the recommended training input is a
+standard `.npz` file. Advanced users can register custom components with
+`droweeg.register_model(...)`, `droweeg.register_dataset(...)`, and
+`droweeg.register_method(...)`. See `docs/custom_model.md`.
 
 ## Raw Data vs DrowEEG Standard Format
 
 DrowEEG does not aim to parse every raw EEG format. Different labs store the same EEG dataset in different raw layouts, so general raw-format support would make the package unstable.
 
-The recommended custom-data route is:
+The recommended route for every dataset, including a user's private dataset, is:
 
 1. Preprocess your EEG into windowed arrays.
 2. Store samples as `X` with shape `(N, C, T)`.
 3. Provide labels `y` and subject IDs `subjects`.
-4. Use `Dataset.from_arrays(...)` or save a reusable `standard-npz` file.
+4. Use `Dataset.from_arrays(...)` or save a reusable standard `.npz` file.
 
 Example:
 
@@ -69,16 +82,21 @@ droweeg.save_standard_dataset(
     label_names={0: "alert", 1: "fatigue"},
 )
 
-dataset = droweeg.dataset("standard-npz", path="my_dataset.npz")
+dataset = droweeg.load_dataset("my_dataset.npz")
+model = droweeg.model("eegnet", dataset=dataset)
 ```
 
-Official adapters such as `seedvig` and `sadt-balanced` exist for selected public datasets and convert their known formats into the same internal standard representation:
+Train from the file:
 
-```python
-standard = droweeg.dataset(
-    "sadt-balanced",
-    path="data/processed/sadt/sad-data.mat",
-).to_standard_dataset()
+```bash
+python -m droweeg.train \
+  --data my_dataset.npz \
+  --model eegnet \
+  --method source_only \
+  --protocol loso \
+  --run-all-loso \
+  --epochs 50 \
+  --device cuda
 ```
 
 See `docs/standard_dataset_format.md`.
@@ -121,10 +139,14 @@ Colab / Google Drive example:
 /content/drive/MyDrive/SEED-VIG/perclos_labels
 ```
 
-SADT-balanced is a processed balanced `.mat` mini dataset and should also stay out of Git. This is not the raw/continuous SADT `.set` dataset. The default local path is:
+SADT-balanced can be converted to a standard `.npz` file. The source `.mat`
+should also stay out of Git. This is not the raw/continuous SADT `.set` dataset.
 
-```text
-data/processed/sadt/sad-data.mat
+```bash
+python scripts/convert_sadt_balanced_standard.py \
+  --input-path data/processed/sadt/sad-balance.mat \
+  --output-path data/processed/sadt/sadt_balanced.npz \
+  --overwrite
 ```
 
 ## Building SEED-VIG Standard Cached Datasets
@@ -173,8 +195,7 @@ Train from a cached file:
 
 ```bash
 python -m droweeg.train \
-  --dataset standard-npz \
-  --path /content/drive/MyDrive/EEG-Data/processed/seedvig/seedvig_8s_threshold35_min50_all_sessions.npz \
+  --data /content/drive/MyDrive/EEG-Data/processed/seedvig/seedvig_8s_threshold35_min50_all_sessions.npz \
   --model eegnet \
   --method source_only \
   --protocol loso \
@@ -222,7 +243,7 @@ table.
 ```bash
 python scripts/build_sadt_rt_standard.py \
   --input-dir data/sadt-raw \
-  --output-path data/processed/sadt/sadt_rt_icnn_compatible_unbalanced.npz \
+  --output-path data/processed/sadt/sadt_unbalanced.npz \
   --sfreq-out 128 \
   --epoch-seconds 3 \
   --rt-cleaning range \
@@ -241,8 +262,7 @@ Training from the cache:
 
 ```bash
 python -m droweeg.train \
-  --dataset standard-npz \
-  --path data/processed/sadt/sadt_rt_icnn_compatible_unbalanced.npz \
+  --data data/processed/sadt/sadt_unbalanced.npz \
   --model eegnet \
   --method source_only \
   --protocol loso \
@@ -273,15 +293,15 @@ One-fold CPU smoke test:
 python train_eegnet_source.py --target-subject 1 --epochs 1 --batch-size 64 --device cpu --label-mode threshold35 --class-balance weighted_loss
 ```
 
-## Running Different Datasets And Models
+## Running Standard Datasets And Models
 
 For now, `eegnet` is the only supported model and `source_only` is the only supported method. New DrowEEG commands use `python -m droweeg.train`.
 
-SEED-VIG example:
+SEED-VIG cached-file example:
 
 ```bash
 python -m droweeg.train \
-  --dataset seedvig \
+  --data data/processed/seedvig/seedvig_8s_threshold35_min50_all_sessions.npz \
   --model eegnet \
   --method source_only \
   --protocol loso \
@@ -289,7 +309,6 @@ python -m droweeg.train \
   --epochs 2 \
   --batch-size 64 \
   --device cpu \
-  --label-mode threshold35 \
   --class-balance weighted_loss
 ```
 
@@ -297,11 +316,10 @@ SADT-balanced example:
 
 ```bash
 python -m droweeg.train \
-  --dataset sadt-balanced \
+  --data data/processed/sadt/sadt_balanced.npz \
   --model eegnet \
   --method source_only \
   --protocol loso \
-  --sadt-balanced-path data/processed/sadt/sad-data.mat \
   --target-subject 1 \
   --epochs 2 \
   --batch-size 64 \
@@ -310,15 +328,14 @@ python -m droweeg.train \
   --class-balance weighted_loss
 ```
 
-SADT-balanced full LOSO GPU example:
+SADT unbalanced full LOSO GPU example:
 
 ```bash
 python -m droweeg.train \
-  --dataset sadt-balanced \
+  --data data/processed/sadt/sadt_unbalanced.npz \
   --model eegnet \
   --method source_only \
   --protocol loso \
-  --sadt-balanced-path data/processed/sadt/sad-data.mat \
   --run-all-loso \
   --epochs 50 \
   --batch-size 64 \
@@ -332,7 +349,7 @@ Dry run:
 
 ```bash
 python -m droweeg.train \
-  --dataset sadt-balanced \
+  --data data/processed/sadt/sadt_unbalanced.npz \
   --model eegnet \
   --method source_only \
   --protocol loso \

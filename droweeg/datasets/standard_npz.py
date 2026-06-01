@@ -365,6 +365,61 @@ def standard_counts(arrays: dict[str, np.ndarray]) -> dict[str, int]:
     }
 
 
+def make_toy_dataset(
+    *,
+    n_subjects: int = 4,
+    samples_per_subject: int = 20,
+    channels: int = 8,
+    samples: int = 128,
+    sfreq: float = 128.0,
+    random_state: int = 42,
+) -> StandardDataset:
+    """Create a tiny synthetic DrowEEG-standard dataset for examples and smoke tests.
+
+    The toy data is not a benchmark. It only illustrates the required `(N, C, T)`
+    array convention, subject-wise LOSO splitting, and `.npz` save/load workflow.
+    """
+    if n_subjects < 2:
+        raise ValueError("n_subjects must be at least 2 for subject-wise evaluation")
+    if samples_per_subject < 2:
+        raise ValueError("samples_per_subject must be at least 2")
+    if channels < 1 or samples < 1:
+        raise ValueError("channels and samples must be positive")
+
+    rng = np.random.default_rng(random_state)
+    n_samples = int(n_subjects * samples_per_subject)
+    subject_ids = np.repeat(np.arange(1, n_subjects + 1, dtype=np.int64), samples_per_subject)
+    y = np.tile(np.asarray([0, 1], dtype=np.int64), int(np.ceil(n_samples / 2)))[:n_samples]
+    X = rng.normal(0.0, 1.0, size=(n_samples, channels, samples)).astype(np.float32)
+
+    time = np.linspace(0.0, 1.0, samples, endpoint=False, dtype=np.float32)
+    class_signal = np.sin(2.0 * np.pi * 8.0 * time).astype(np.float32)
+    X[y == 1, 0, :] += 0.35 * class_signal
+    if channels > 1:
+        X[y == 0, 1, :] += 0.20 * np.cos(2.0 * np.pi * 6.0 * time).astype(np.float32)
+
+    sessions = np.asarray([f"subject_{subject}_session_1" for subject in subject_ids], dtype=object)
+    sample_ids = np.asarray([f"toy_s{subject:02d}_w{idx:04d}" for idx, subject in enumerate(subject_ids)], dtype=object)
+    channel_names = [f"Ch{idx + 1}" for idx in range(channels)]
+    return StandardDataset.from_arrays(
+        X=X,
+        y=y,
+        subjects=subject_ids,
+        sessions=sessions,
+        sample_ids=sample_ids,
+        sfreq=sfreq,
+        channel_names=channel_names,
+        label_names={0: "alert", 1: "fatigue"},
+        metadata={
+            "dataset_name": "toy",
+            "protocol_name": "toy-binary",
+            "description": "Synthetic DrowEEG-standard toy dataset for API examples and smoke tests.",
+            "normalization": "not_applied_in_cache",
+            "robust_clipping": "not_applied_in_cache",
+        },
+    )
+
+
 def _as_1d(values: np.ndarray, name: str, n_samples: int) -> np.ndarray:
     values = np.asarray(values).reshape(-1)
     if len(values) != n_samples:
