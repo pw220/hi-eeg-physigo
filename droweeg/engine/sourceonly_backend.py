@@ -40,6 +40,7 @@ from data.sadt_dataset import load_sadt_arrays, sadt_counts
 from droweeg.datasets.standard_npz import load_standard_dataset, standard_counts
 from droweeg.engine import checkpointing as engine_checkpointing
 from droweeg.engine import evaluator as engine_evaluator
+from droweeg.engine import trainer as engine_trainer
 from droweeg.protocols import loso as loso_protocol
 from droweeg.registries import get_method, register_builtin_components
 from models.factory import build_model
@@ -806,7 +807,7 @@ def run_loso_fold(
         print_source_split_sanity(train, val)
     elif should_log(args, "verbose"):
         print_source_split_sanity(train, val)
-    train_x, val_x, preprocess_state = preprocess_source(
+    train_x, val_x, preprocess_state = engine_trainer.preprocess_source(
         train["x"],
         None if val is None else val["x"],
         robust_clip=args.robust_clip,
@@ -823,12 +824,12 @@ def run_loso_fold(
     # Target labels are loaded after source-only preprocessing state is fixed;
     # they are used only for final evaluation and saved prediction diagnostics.
     assert set(test["subject_id"]) == {plan.target_subject}
-    test["x"] = preprocess_target(test["x"], preprocess_state)
+    test["x"] = engine_trainer.preprocess_target(test["x"], preprocess_state)
     if should_log(args, "debug"):
         print_target_sanity(test_sessions, test, context)
         print_nan_inf_after_preprocessing(("test", test))
 
-    train_loader = make_loader(
+    train_loader = engine_trainer.make_loader(
         train,
         args.batch_size,
         shuffle=True,
@@ -837,14 +838,14 @@ def run_loso_fold(
     )
     val_loader = None
     if val is not None:
-        val_loader = make_loader(
+        val_loader = engine_trainer.make_loader(
             val,
             args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
             seed=args.seed,
         )
-    test_loader = make_loader(
+    test_loader = engine_trainer.make_loader(
         test,
         args.batch_size,
         shuffle=False,
@@ -861,7 +862,7 @@ def run_loso_fold(
             "verbose",
         )
 
-    class_weights = compute_class_weights(train["y"], args.class_balance)
+    class_weights = engine_trainer.compute_class_weights(train["y"], args.class_balance)
     if should_log(args, "debug"):
         print_class_balance(train["y"], args.class_balance, class_weights)
     criterion_weight = None if class_weights is None else torch.tensor(class_weights, dtype=torch.float32, device=device)
@@ -871,13 +872,13 @@ def run_loso_fold(
         print_model_and_training_config(args, model_config)
     set_seed(args.seed, deterministic=args.deterministic)
     model = build_model(args.model, context.input_channels, context.input_samples, context.num_classes, args).to(device)
-    optimizer = make_optimizer(model, args)
-    scheduler = make_scheduler(optimizer, args)
-    criterion = make_criterion(args, criterion_weight)
-    initial_checksum = model_parameter_checksum(model)
+    optimizer = engine_trainer.make_optimizer(model, args)
+    scheduler = engine_trainer.make_scheduler(optimizer, args)
+    criterion = engine_trainer.make_criterion(args, criterion_weight)
+    initial_checksum = engine_trainer.model_parameter_checksum(model)
     if args.debug_repro:
         print(f"debug_repro initial_parameter_checksum={initial_checksum}")
-        print(f"debug_repro first_20_train_sample_ids={first_shuffled_sample_ids(train, args.seed, 20)}")
+        print(f"debug_repro first_20_train_sample_ids={engine_trainer.first_shuffled_sample_ids(train, args.seed, 20)}")
 
     checkpoint_tracker = engine_checkpointing.CheckpointTracker(
         policy=args.checkpoint_policy,
@@ -892,7 +893,7 @@ def run_loso_fold(
     if should_log(args, "normal"):
         print_epoch_header(val_loader is not None)
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_metrics = train_one_epoch(
+        train_loss, train_metrics = engine_trainer.train_one_epoch(
             model,
             train_loader,
             optimizer,
@@ -902,7 +903,7 @@ def run_loso_fold(
             show_progress=should_log(args, "debug"),
         )
         if args.debug_repro and epoch == 1:
-            print(f"debug_repro epoch1_parameter_checksum={model_parameter_checksum(model)}")
+            print(f"debug_repro epoch1_parameter_checksum={engine_trainer.model_parameter_checksum(model)}")
         val_metrics = None
         monitor_value = np.nan
         if val_loader is not None:
@@ -955,7 +956,7 @@ def run_loso_fold(
             print_best_target_diagnostic_metrics(best_target_diagnostic_epoch, best_target_diagnostic_metrics)
     model.load_state_dict(selected_state)
     method = get_method(args.method)()
-    target_unlabeled_loader = make_unlabeled_loader(test, args.batch_size, args.num_workers, args.seed)
+    target_unlabeled_loader = engine_trainer.make_unlabeled_loader(test, args.batch_size, args.num_workers, args.seed)
     model = method.adapt(model, target_unlabeled_loader, ctx={"fold": plan, "adaptation_protocol": args.adaptation_protocol})
     if val is not None and plan.outputs_enabled:
         save_validation_subject_metrics(
@@ -1011,7 +1012,7 @@ def run_loso_fold(
         "val_subject_raw_ids": plan.val_subject_raw_ids,
         "normalization_mean": torch.from_numpy(preprocess_state["mean"].copy()),
         "normalization_std": torch.from_numpy(preprocess_state["std"].copy()),
-        "clipping_thresholds": tensorize_clip_bounds(preprocess_state["clip_bounds"]),
+        "clipping_thresholds": engine_trainer.tensorize_clip_bounds(preprocess_state["clip_bounds"]),
         "class_weights": None if class_weights is None else class_weights.tolist(),
         "best_epoch": None if not has_validation else best_epoch,
         "best_target_diagnostic_epoch": best_target_diagnostic_epoch,
