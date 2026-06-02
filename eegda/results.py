@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Any
 
 
-class DrowEEGResults:
-    """Lightweight result handle returned by ``droweeg.run``."""
+class EEGDAResults:
+    """Lightweight result handle returned by ``eegda.run``."""
 
     def __init__(self, metadata: dict[str, Any]) -> None:
         self.metadata = metadata
@@ -28,7 +28,7 @@ class DrowEEGResults:
 
     def summary(self) -> None:
         if not self.output_dir:
-            print("DrowEEG Results")
+            print("EEGDA Results")
             print("No output directory was saved for this run.")
             return
         rows = _records(self.fold_metrics)
@@ -138,6 +138,9 @@ class DrowEEGResults:
         if not rows:
             return None
         return max(rows, key=lambda row: float(row["macro_f1"])) if best else min(rows, key=lambda row: float(row["macro_f1"]))
+
+
+DrowEEGResults = EEGDAResults
 
 
 def _records(table: Any) -> list[dict[str, Any]]:

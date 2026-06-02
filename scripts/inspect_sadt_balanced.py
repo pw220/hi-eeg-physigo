@@ -8,7 +8,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from droweeg.datasets.sadt_balanced import inspect
+from eegda.datasets.sadt_balanced import inspect
 
 
 def main() -> None:

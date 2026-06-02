@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import droweeg
+import eegda
 
 GOLDEN_PATH = ROOT / "tests" / "golden_sourceonly.json"
 TOL = 1e-5
@@ -16,13 +16,13 @@ TOL = 1e-5
 
 def test_sourceonly_matches_golden(tmp_path: Path) -> None:
     golden = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
-    toy = droweeg.make_toy_dataset(**golden["config"]["toy"])
+    toy = eegda.make_toy_dataset(**golden["config"]["toy"])
     data_path = tmp_path / "toy_sourceonly.npz"
     output_dir = tmp_path / "outputs"
     toy.save(data_path)
 
     run = golden["config"]["run"]
-    results = droweeg.run(
+    results = eegda.run(
         data=str(data_path),
         model="eegnet",
         method="source_only",

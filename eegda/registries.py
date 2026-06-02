@@ -49,10 +49,10 @@ def register_builtin_components() -> None:
     global _BUILTINS_REGISTERED
     if _BUILTINS_REGISTERED:
         return
-    from droweeg.datasets.sadt_balanced import SADTBalancedDataset
-    from droweeg.datasets.seedvig import SeedVIGDataset
-    from droweeg.datasets.standard_npz import StandardDataset
-    from droweeg.methods.source_only import SourceOnlyMethod
+    from eegda.datasets.sadt_balanced import SADTBalancedDataset
+    from eegda.datasets.seedvig import SeedVIGDataset
+    from eegda.datasets.standard_npz import StandardDataset
+    from eegda.methods.source_only import SourceOnlyMethod
     from models.eegnet import EEGNet
 
     register_dataset("seedvig", SeedVIGDataset)

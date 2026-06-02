@@ -11,7 +11,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import droweeg
+import eegda
 
 
 GOLDEN_PATH = ROOT / "tests" / "golden_sourceonly.json"
@@ -62,11 +62,11 @@ METRIC_KEYS = [
 
 def main() -> None:
     GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="droweeg_golden_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="eegda_golden_") as tmp:
         tmpdir = Path(tmp)
         data_path = tmpdir / "toy_sourceonly.npz"
         output_dir = tmpdir / "outputs"
-        toy = droweeg.make_toy_dataset(**GOLDEN_CONFIG["toy"])
+        toy = eegda.make_toy_dataset(**GOLDEN_CONFIG["toy"])
         toy.save(data_path)
         run = GOLDEN_CONFIG["run"]
         cmd = [
@@ -106,7 +106,7 @@ def main() -> None:
             "--output-dir",
             str(output_dir),
             "--output-layout",
-            "droweeg",
+            "eegda",
             "--log-level",
             "quiet",
         ]

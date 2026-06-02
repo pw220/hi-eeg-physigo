@@ -1,6 +1,6 @@
-# DrowEEG
+# EEGDA
 
-DrowEEG is a lightweight research package for EEG-based drowsiness recognition. The current stable method is an EEGNet source-only LOSO baseline for SEED-VIG raw EEG and the processed balanced SADT mini dataset.
+EEGDA is a lightweight research package for EEG-based drowsiness recognition. The current stable method is an EEGNet source-only LOSO baseline for SEED-VIG raw EEG and the processed balanced SADT mini dataset.
 
 No TRACE, SFDA, Riemannian reference, pseudo-labeling, entropy minimization, or adaptation method is implemented in the current baseline.
 
@@ -12,19 +12,19 @@ and revealing target labels only inside final evaluation metrics.
 ## Package API
 
 The recommended interface is path-based: users preprocess data once into a
-DrowEEG-standard `.npz`, then pass that file to DrowEEG.
+EEGDA-standard `.npz`, then pass that file to EEGDA.
 
 ```python
-import droweeg
+import eegda
 
-print(droweeg.list_models())
-print(droweeg.list_methods())
+print(eegda.list_models())
+print(eegda.list_methods())
 
-dataset = droweeg.load_dataset("data/processed/sadt/sadt_unbalanced.npz")
+dataset = eegda.load_dataset("data/processed/sadt/sadt_unbalanced.npz")
 dataset.summary()
-model = droweeg.model("eegnet", dataset=dataset)
+model = eegda.model("eegnet", dataset=dataset)
 
-results = droweeg.run(
+results = eegda.run(
     data="data/processed/sadt/sadt_unbalanced.npz",
     model="eegnet",
     method="source_only",
@@ -38,21 +38,21 @@ results.summary()
 ```
 
 LOSO target selection uses stable fold subject indices. If raw subject IDs are
-not continuous, DrowEEG maps them to `1..N` and keeps the original IDs in logs,
+not continuous, EEGDA maps them to `1..N` and keeps the original IDs in logs,
 summary CSVs, and prediction CSVs.
 
 ```python
-dataset = droweeg.load_dataset("my_dataset.npz")
+dataset = eegda.load_dataset("my_dataset.npz")
 print(dataset.get_subject_mapping())  # e.g. {1: "a", 2: "b", 3: "d", 4: "f"}
 ```
 
-By default, `droweeg.run(...)` evaluates the full LOSO protocol. Run one fold
+By default, `eegda.run(...)` evaluates the full LOSO protocol. Run one fold
 with `target_subject=1`, selected folds with `target_subjects=[1, 3]`, or
 explicitly request every fold with `run_all_loso=True`. Selected folds and full
 LOSO are mutually exclusive.
 
 ```python
-results = droweeg.run(
+results = eegda.run(
     data="data/processed/sadt/sadt_unbalanced.npz",
     model="eegnet",
     method="source_only",
@@ -68,10 +68,10 @@ results = droweeg.run(
 You can also select by raw subject IDs:
 
 ```python
-dataset = droweeg.load_dataset("data/processed/sadt/sadt_unbalanced.npz")
+dataset = eegda.load_dataset("data/processed/sadt/sadt_unbalanced.npz")
 dataset.summary()
 
-results = droweeg.run(
+results = eegda.run(
     dataset=dataset,
     model="eegnet",
     method="source_only",
@@ -104,9 +104,9 @@ Detailed run information is saved under the run directory, including
 Create a small synthetic example dataset:
 
 ```python
-toy = droweeg.make_toy_dataset(n_subjects=4, samples_per_subject=20)
-toy.save("toy_droweeg.npz")
-print(droweeg.load_dataset("toy_droweeg.npz").get_metadata())
+toy = eegda.make_toy_dataset(n_subjects=4, samples_per_subject=20)
+toy.save("toy_eegda.npz")
+print(eegda.load_dataset("toy_eegda.npz").get_metadata())
 ```
 
 Current public model/method names:
@@ -117,12 +117,12 @@ Current public model/method names:
 Official adapters such as `seedvig` and `sadt-balanced` are provided for
 conversion and backward compatibility, but the recommended training input is a
 standard `.npz` file. Advanced users can register custom components with
-`droweeg.register_model(...)`, `droweeg.register_dataset(...)`, and
-`droweeg.register_method(...)`. See `docs/custom_model.md`.
+`eegda.register_model(...)`, `eegda.register_dataset(...)`, and
+`eegda.register_method(...)`. See `docs/custom_model.md`.
 
-## Raw Data vs DrowEEG Standard Format
+## Raw Data vs EEGDA Standard Format
 
-DrowEEG does not aim to parse every raw EEG format. Different labs store the same EEG dataset in different raw layouts, so general raw-format support would make the package unstable.
+EEGDA does not aim to parse every raw EEG format. Different labs store the same EEG dataset in different raw layouts, so general raw-format support would make the package unstable.
 
 The recommended route for every dataset, including a user's private dataset, is:
 
@@ -134,7 +134,7 @@ The recommended route for every dataset, including a user's private dataset, is:
 Example:
 
 ```python
-dataset = droweeg.Dataset.from_arrays(
+dataset = eegda.Dataset.from_arrays(
     X=X,
     y=y,
     subjects=subjects,
@@ -142,7 +142,7 @@ dataset = droweeg.Dataset.from_arrays(
     label_names={0: "alert", 1: "fatigue"},
 )
 
-droweeg.save_standard_dataset(
+eegda.save_standard_dataset(
     "my_dataset.npz",
     X=X,
     y=y,
@@ -151,14 +151,14 @@ droweeg.save_standard_dataset(
     label_names={0: "alert", 1: "fatigue"},
 )
 
-dataset = droweeg.load_dataset("my_dataset.npz")
-model = droweeg.model("eegnet", dataset=dataset)
+dataset = eegda.load_dataset("my_dataset.npz")
+model = eegda.model("eegnet", dataset=dataset)
 ```
 
 Train from the file:
 
 ```bash
-python -m droweeg.train \
+python -m eegda.train \
   --data my_dataset.npz \
   --model eegnet \
   --method source_only \
@@ -181,7 +181,7 @@ See `docs/standard_dataset_format.md`.
 
 Active files:
 
-- `python -m droweeg.train`
+- `python -m eegda.train`
 - `train_eegnet_source.py`
 - `data/seedvig_dataset.py`
 - `data/seedvig_integrity.py`
@@ -220,7 +220,7 @@ python scripts/convert_sadt_balanced_standard.py \
 
 ## Building SEED-VIG Standard Cached Datasets
 
-DrowEEG does not bundle SEED-VIG data. Provide your local `Raw_Data` and `perclos_labels` folders, then build reusable DrowEEG-standard `.npz` caches. The cache contains fixed EEG windows, labels, subjects, sessions, sample IDs, PERCLOS values, and metadata only.
+EEGDA does not bundle SEED-VIG data. Provide your local `Raw_Data` and `perclos_labels` folders, then build reusable EEGDA-standard `.npz` caches. The cache contains fixed EEG windows, labels, subjects, sessions, sample IDs, PERCLOS values, and metadata only.
 
 The cache builder does not apply global normalization, robust clipping, class balancing, class weights, or train/test splitting. Fold-specific preprocessing remains inside training so normalization and optional clipping are computed from source-training samples only.
 
@@ -263,7 +263,7 @@ python scripts/build_seedvig_standard.py \
 Train from a cached file:
 
 ```bash
-python -m droweeg.train \
+python -m eegda.train \
   --data /content/drive/MyDrive/EEG-Data/processed/seedvig/seedvig_8s_threshold35_min50_all_sessions.npz \
   --model eegnet \
   --method source_only \
@@ -278,7 +278,7 @@ python -m droweeg.train \
 
 ## Building SADT RT-Labelled Unbalanced Dataset
 
-DrowEEG does not bundle SADT data. Provide the official preprocessed continuous EEGLAB `.set/.fdt` sessions. The builder extracts 3-second pre-deviation EEG epochs, downsamples each epoch to 128 Hz, labels trials from local/global reaction time, discards transition trials, filters sessions with too few samples in either class, and selects the most balanced valid session per subject by default.
+EEGDA does not bundle SADT data. Provide the official preprocessed continuous EEGLAB `.set/.fdt` sessions. The builder extracts 3-second pre-deviation EEG epochs, downsamples each epoch to 128 Hz, labels trials from local/global reaction time, discards transition trials, filters sessions with too few samples in either class, and selects the most balanced valid session per subject by default.
 
 The final dataset is not forced to be class-balanced. Global normalization, robust clipping, and class weighting are not applied during cache construction; they remain fold-specific inside training.
 
@@ -330,7 +330,7 @@ python scripts/build_sadt_rt_standard.py \
 Training from the cache:
 
 ```bash
-python -m droweeg.train \
+python -m eegda.train \
   --data data/processed/sadt/sadt_unbalanced.npz \
   --model eegnet \
   --method source_only \
@@ -364,12 +364,12 @@ python train_eegnet_source.py --target-subject 1 --epochs 1 --batch-size 64 --de
 
 ## Running Standard Datasets And Models
 
-For now, `eegnet` is the only supported model and `source_only` is the only supported method. New DrowEEG commands use `python -m droweeg.train`.
+For now, `eegnet` is the only supported model and `source_only` is the only supported method. New EEGDA commands use `python -m eegda.train`.
 
 SEED-VIG cached-file example:
 
 ```bash
-python -m droweeg.train \
+python -m eegda.train \
   --data data/processed/seedvig/seedvig_8s_threshold35_min50_all_sessions.npz \
   --model eegnet \
   --method source_only \
@@ -384,7 +384,7 @@ python -m droweeg.train \
 SADT-balanced example:
 
 ```bash
-python -m droweeg.train \
+python -m eegda.train \
   --data data/processed/sadt/sadt_balanced.npz \
   --model eegnet \
   --method source_only \
@@ -400,7 +400,7 @@ python -m droweeg.train \
 SADT unbalanced full LOSO GPU example:
 
 ```bash
-python -m droweeg.train \
+python -m eegda.train \
   --data data/processed/sadt/sadt_unbalanced.npz \
   --model eegnet \
   --method source_only \
@@ -417,7 +417,7 @@ python -m droweeg.train \
 Dry run:
 
 ```bash
-python -m droweeg.train \
+python -m eegda.train \
   --data data/processed/sadt/sadt_unbalanced.npz \
   --model eegnet \
   --method source_only \
@@ -430,7 +430,7 @@ The old `train_eegnet_source.py` commands remain available for backward compatib
 
 ### No-Validation Runs And Target Diagnostics
 
-`--validation-mode none` trains on all non-target source subjects and selects a checkpoint only from the declared `--checkpoint-policy`, usually `last` or `fixed_epoch`. If `--test-every-epochs N` is enabled, DrowEEG periodically evaluates the held-out target subject for diagnostics, but those target metrics are audit-only. They must not be used for early stopping, checkpoint selection, hyperparameter tuning, or model selection.
+`--validation-mode none` trains on all non-target source subjects and selects a checkpoint only from the declared `--checkpoint-policy`, usually `last` or `fixed_epoch`. If `--test-every-epochs N` is enabled, EEGDA periodically evaluates the held-out target subject for diagnostics, but those target metrics are audit-only. They must not be used for early stopping, checkpoint selection, hyperparameter tuning, or model selection.
 
 For package users, prefer `fixed_epoch` when the epoch is pre-declared, or use `subject_split` / `sample_stratified` validation when you need source-only model selection. The reported "best target diagnostic" epoch is useful for analysis plots, not for choosing the final model.
 

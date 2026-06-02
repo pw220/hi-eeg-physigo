@@ -1,10 +1,10 @@
-# Custom Models In DrowEEG
+# Custom Models In EEGDA
 
-DrowEEG currently ships with `eegnet`. Advanced users can register a custom model from Python:
+EEGDA currently ships with `eegnet`. Advanced users can register a custom model from Python:
 
 ```python
 import torch
-import droweeg
+import eegda
 
 
 class MyModel(torch.nn.Module):
@@ -17,8 +17,8 @@ class MyModel(torch.nn.Module):
         return self.classifier(x.flatten(1))
 
 
-droweeg.register_model("my_model", MyModel)
-model = droweeg.model("my_model", channels=17, samples=1600, num_classes=2)
+eegda.register_model("my_model", MyModel)
+model = eegda.model("my_model", channels=17, samples=1600, num_classes=2)
 ```
 
 Minimum contract:

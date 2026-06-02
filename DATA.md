@@ -36,7 +36,7 @@ python train_eegnet_source.py \
 ```
 
 Processed local datasets are also ignored by Git. The current recommended
-DrowEEG-standard files are:
+EEGDA-standard files are:
 
 ```text
 data/processed/

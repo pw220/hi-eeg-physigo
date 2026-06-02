@@ -8,12 +8,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from droweeg.datasets.sadt_balanced import SADTBalancedDataset
+from eegda.datasets.sadt_balanced import SADTBalancedDataset
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert the processed balanced SADT .mat file to DrowEEG-standard .npz."
+        description="Convert the processed balanced SADT .mat file to EEGDA-standard .npz."
     )
     parser.add_argument("--input-path", default="data/processed/sadt/sad-balance.mat")
     parser.add_argument("--output-path", default="data/processed/sadt/sadt_balanced.npz")
@@ -40,7 +40,7 @@ def main() -> None:
     print(f"  subjects={metadata['subjects']}")
     print(f"  label_distribution={metadata['label_distribution']}")
     dataset.save(output_path)
-    print(f"Saved DrowEEG-standard dataset: {output_path}")
+    print(f"Saved EEGDA-standard dataset: {output_path}")
 
 
 if __name__ == "__main__":

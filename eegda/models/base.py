@@ -3,8 +3,8 @@ from __future__ import annotations
 import torch
 
 
-class DrowEEGModel(torch.nn.Module):
-    """Base documentation class for DrowEEG models.
+class EEGDAModel(torch.nn.Module):
+    """Base documentation class for EEGDA models.
 
     Model contract:
     - input shape: (batch, 1, channels, samples)

@@ -37,12 +37,12 @@ from data.seedvig_dataset import (
     sessions_to_arrays,
 )
 from data.sadt_dataset import load_sadt_arrays, sadt_counts
-from droweeg.datasets.standard_npz import load_standard_dataset, standard_counts
-from droweeg.engine import checkpointing as engine_checkpointing
-from droweeg.engine import evaluator as engine_evaluator
-from droweeg.engine import trainer as engine_trainer
-from droweeg.protocols import loso as loso_protocol
-from droweeg.registries import get_method, register_builtin_components
+from eegda.datasets.standard_npz import load_standard_dataset, standard_counts
+from eegda.engine import checkpointing as engine_checkpointing
+from eegda.engine import evaluator as engine_evaluator
+from eegda.engine import trainer as engine_trainer
+from eegda.protocols import loso as loso_protocol
+from eegda.registries import get_method, register_builtin_components
 from models.factory import build_model
 from utils.metrics import classification_metrics, entropy_from_probs, softmax
 from utils.seed import set_seed
@@ -200,7 +200,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--eegnet-norm-rate", type=float, default=0.25)
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--outputs-dir", dest="output_dir", help=argparse.SUPPRESS)
-    parser.add_argument("--output-layout", choices=("flat", "droweeg"), default="flat", help=argparse.SUPPRESS)
+    parser.add_argument("--output-layout", choices=("flat", "eegda", "droweeg"), default="flat", help=argparse.SUPPRESS)
     parser.add_argument("--save-latest", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -414,7 +414,7 @@ def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> Datase
             )
             reports[label_mode] = report
             if not args.dry_run and outputs_enabled(args):
-                integrity_dir = outputs_dir / "reports" if args.output_layout == "droweeg" else outputs_dir
+                integrity_dir = outputs_dir / "reports" if args.output_layout in {"eegda", "droweeg"} else outputs_dir
                 save_integrity_csv(report, integrity_dir / f"seedvig_integrity_{label_mode}.csv")
         report = reports[args.label_mode]
         file_pairs = report.valid_file_pairs
@@ -652,7 +652,7 @@ def plan_loso_fold(
     checkpoints_dir = outputs_dir / "checkpoints"
     output_stem = f"{context.dataset}_{context.model_name}_source_only_{context.label_protocol}_subject_{target_subject}"
     summary_stem = f"{context.dataset}_{context.model_name}_source_only_{context.label_protocol}"
-    if args.output_layout == "droweeg":
+    if args.output_layout in {"eegda", "droweeg"}:
         prediction_path = outputs_dir / "predictions" / f"{output_stem}.csv"
         summary_path = outputs_dir / "summaries" / f"{summary_stem}_summary.csv"
         fold_report_path = outputs_dir / "reports" / f"loso_fold_integrity_{summary_stem}_subject_{target_subject}.txt"
@@ -1369,7 +1369,7 @@ def print_run_overview(
     device: torch.device,
 ) -> None:
     output_dir = "none" if not plans else str(run_dir(plans[0])) if outputs_enabled(args) else "none"
-    print("DrowEEG Benchmark Run")
+    print("EEGDA Benchmark Run")
     print("-" * 21)
     print(f"Dataset        : {context.dataset}")
     print("Protocol       : LOSO source-only")
@@ -2699,7 +2699,7 @@ def print_recommended_gpu_command(args: argparse.Namespace) -> None:
         if args.raw_data_dir is not None and args.label_dir is not None:
             path_args = f" --raw-data-dir {args.raw_data_dir} --label-dir {args.label_dir}"
         print(
-            "python -m droweeg.train --dataset seedvig --model eegnet --method source_only --protocol loso "
+            "python -m eegda.train --dataset seedvig --model eegnet --method source_only --protocol loso "
             "--run-all-loso --epochs 100 --batch-size 64 --device cuda --label-mode threshold35 "
             "--class-balance weighted_loss --optimizer adamw --weight-decay 0.0001 "
             "--early-stop-patience 15 --monitor-metric macro_f1"
@@ -2708,7 +2708,7 @@ def print_recommended_gpu_command(args: argparse.Namespace) -> None:
         return
     if args.dataset == "sadt":
         print(
-            "python -m droweeg.train --dataset sadt-balanced --model eegnet --method source_only --protocol loso "
+            "python -m eegda.train --dataset sadt-balanced --model eegnet --method source_only --protocol loso "
             f"--sadt-balanced-path {args.sadt_path} --run-all-loso --epochs 50 --batch-size 64 "
             "--device cuda --validation-mode none --checkpoint-policy last "
             f"--class-balance {args.class_balance}"
@@ -2716,7 +2716,7 @@ def print_recommended_gpu_command(args: argparse.Namespace) -> None:
         return
     if args.dataset == "standard-npz":
         print(
-            "python -m droweeg.train --data my_dataset.npz "
+            "python -m eegda.train --data my_dataset.npz "
             "--model eegnet --method source_only --protocol loso --run-all-loso --epochs 50 "
             "--batch-size 64 --device cuda --validation-mode none --checkpoint-policy last"
         )

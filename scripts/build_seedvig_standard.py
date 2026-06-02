@@ -21,7 +21,7 @@ from data.seedvig_dataset import (
     _extract_sample_rate,
     parse_subject_id,
 )
-from droweeg.datasets.standard_npz import save_standard_dataset
+from eegda.datasets.standard_npz import save_standard_dataset
 
 
 @dataclass
@@ -47,7 +47,7 @@ class SessionCache:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build DrowEEG-standard SEED-VIG cached datasets.")
+    parser = argparse.ArgumentParser(description="Build EEGDA-standard SEED-VIG cached datasets.")
     parser.add_argument("--raw-data-dir", required=True)
     parser.add_argument("--label-dir", required=True)
     parser.add_argument("--output-path", required=True)

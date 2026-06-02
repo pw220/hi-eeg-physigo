@@ -10,7 +10,7 @@ from .base import EEGDataset, EEGFold
 
 
 class StandardDataset(EEGDataset):
-    """DrowEEG standard array dataset.
+    """EEGDA standard array dataset.
 
     Required arrays:
     - X: float32, shape (N, C, T)
@@ -124,7 +124,7 @@ class StandardDataset(EEGDataset):
         label_names = metadata.get("label_names") or {0: "alert", 1: "fatigue"}
         label_items = sorted(label_names.items(), key=lambda item: int(item[0]) if str(item[0]).isdigit() else str(item[0]))
         class_text = ", ".join(str(name) for _, name in label_items)
-        print("DrowEEG Dataset")
+        print("EEGDA Dataset")
         print("-" * 15)
         print(f"Name           : {metadata.get('dataset_name')}")
         print(f"Samples        : {metadata.get('samples')}")
@@ -211,7 +211,7 @@ class StandardDataset(EEGDataset):
         return rows
 
     def build_fold(self, target_subject: int, validation_mode: str = "subject_split", seed: int = 42, **kwargs) -> EEGFold:
-        from droweeg.protocols.splits import build_array_loso_fold
+        from eegda.protocols.splits import build_array_loso_fold
 
         arrays = self.get_data()
         fold = build_array_loso_fold(
@@ -510,7 +510,7 @@ def make_toy_dataset(
     sfreq: float = 128.0,
     random_state: int = 42,
 ) -> StandardDataset:
-    """Create a tiny synthetic DrowEEG-standard dataset for examples and smoke tests.
+    """Create a tiny synthetic EEGDA-standard dataset for examples and smoke tests.
 
     The toy data is not a benchmark. It only illustrates the required `(N, C, T)`
     array convention, subject-wise LOSO splitting, and `.npz` save/load workflow.
@@ -549,7 +549,7 @@ def make_toy_dataset(
         metadata={
             "dataset_name": "toy",
             "protocol_name": "toy-binary",
-            "description": "Synthetic DrowEEG-standard toy dataset for API examples and smoke tests.",
+            "description": "Synthetic EEGDA-standard toy dataset for API examples and smoke tests.",
             "normalization": "not_applied_in_cache",
             "robust_clipping": "not_applied_in_cache",
         },

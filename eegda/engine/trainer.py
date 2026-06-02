@@ -14,7 +14,7 @@ from utils.metrics import classification_metrics, softmax
 
 
 def run_backend(argv: Sequence[str] | None = None) -> None:
-    from droweeg.engine import sourceonly_backend
+    from eegda.engine import sourceonly_backend
 
     sourceonly_backend.main(None if argv is None else list(argv))
 

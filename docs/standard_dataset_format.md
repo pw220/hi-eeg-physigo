@@ -1,6 +1,6 @@
-# DrowEEG Standard Dataset Format
+# EEGDA Standard Dataset Format
 
-DrowEEG does not try to parse every raw EEG format. Users should preprocess their data into windowed EEG arrays once, then train through DrowEEG.
+EEGDA does not try to parse every raw EEG format. Users should preprocess their data into windowed EEG arrays once, then train through EEGDA.
 
 ## Required Data
 
@@ -34,13 +34,13 @@ For binary drowsiness recognition:
 
 ```python
 import numpy as np
-import droweeg
+import eegda
 
 X = np.random.randn(20, 30, 384).astype("float32")
 y = np.array([0, 1] * 10, dtype="int64")
 subjects = np.repeat(np.arange(1, 6), 4)
 
-dataset = droweeg.Dataset.from_arrays(
+dataset = eegda.Dataset.from_arrays(
     X=X,
     y=y,
     subjects=subjects,
@@ -48,13 +48,13 @@ dataset = droweeg.Dataset.from_arrays(
     label_names={0: "alert", 1: "fatigue"},
 )
 
-model = droweeg.model("eegnet", dataset=dataset)
+model = eegda.model("eegnet", dataset=dataset)
 ```
 
 ## Save Once, Reuse Later
 
 ```python
-droweeg.save_standard_dataset(
+eegda.save_standard_dataset(
     "my_dataset.npz",
     X=X,
     y=y,
@@ -67,28 +67,28 @@ droweeg.save_standard_dataset(
 Then load it:
 
 ```python
-dataset = droweeg.load_dataset("my_dataset.npz")
+dataset = eegda.load_dataset("my_dataset.npz")
 print(dataset.get_metadata())
 print(dataset.get_subject_mapping())
 ```
 
-DrowEEG maps whatever you store in `subjects` to stable 1-based fold indices.
+EEGDA maps whatever you store in `subjects` to stable 1-based fold indices.
 For example, raw subjects `["a", "b", "d", "f"]` become fold subjects
 `[1, 2, 3, 4]`. Training commands use the fold index, while reports and
 prediction CSVs also keep the original raw subject ID.
 
-For quick examples and API checks, DrowEEG can generate a synthetic toy file:
+For quick examples and API checks, EEGDA can generate a synthetic toy file:
 
 ```python
-toy = droweeg.make_toy_dataset(n_subjects=4, samples_per_subject=20)
-toy.save("toy_droweeg.npz")
-print(droweeg.load_dataset("toy_droweeg.npz").get_metadata())
+toy = eegda.make_toy_dataset(n_subjects=4, samples_per_subject=20)
+toy.save("toy_eegda.npz")
+print(eegda.load_dataset("toy_eegda.npz").get_metadata())
 ```
 
 ## Train With Standard NPZ
 
 ```bash
-python -m droweeg.train \
+python -m eegda.train \
   --data my_dataset.npz \
   --model eegnet \
   --method source_only \
@@ -101,7 +101,7 @@ python -m droweeg.train \
 Run selected folds:
 
 ```bash
-python -m droweeg.train \
+python -m eegda.train \
   --data my_dataset.npz \
   --model eegnet \
   --method source_only \
@@ -122,7 +122,7 @@ dataset layouts into this same standard representation. They are intended for
 conversion and compatibility, not as the main user-facing API:
 
 ```python
-sadt = droweeg.dataset("sadt-balanced", path="data/processed/sadt/sad-balance.mat")
+sadt = eegda.dataset("sadt-balanced", path="data/processed/sadt/sad-balance.mat")
 standard = sadt.to_standard_dataset()
 standard.save("data/processed/sadt/sadt_balanced.npz")
 print(standard.get_metadata())
@@ -131,7 +131,7 @@ print(standard.get_metadata())
 SEED-VIG can also be converted, but it loads and windows the raw continuous EEG and can be memory-heavy:
 
 ```python
-seedvig = droweeg.dataset(
+seedvig = eegda.dataset(
     "seedvig",
     raw_data_dir="data/raw/SEED-VIG/Raw_Data",
     label_dir="data/raw/SEED-VIG/perclos_labels",

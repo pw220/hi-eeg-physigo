@@ -45,7 +45,7 @@ class EEGDataset:
         label_names: dict[int, str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> "EEGDataset":
-        from droweeg.datasets.standard_npz import StandardDataset
+        from eegda.datasets.standard_npz import StandardDataset
 
         return StandardDataset.from_arrays(
             X=X,

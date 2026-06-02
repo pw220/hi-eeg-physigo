@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 
-from droweeg.registries import get_model, register_builtin_components
+from eegda.registries import get_model, register_builtin_components
 
 
 def build_model(

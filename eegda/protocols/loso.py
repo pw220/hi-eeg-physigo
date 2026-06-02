@@ -8,7 +8,7 @@ import numpy as np
 
 from data.seedvig_dataset import parse_subject_id
 from data.sadt_dataset import sadt_counts
-from droweeg.datasets.standard_npz import standard_counts
+from eegda.datasets.standard_npz import standard_counts
 
 
 def resolve_loso_targets(

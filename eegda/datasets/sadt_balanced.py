@@ -70,7 +70,7 @@ class SADTBalancedDataset(EEGDataset):
         )
 
     def build_fold(self, target_subject: int, validation_mode: str = "subject_split", seed: int = 42, **kwargs) -> EEGFold:
-        from droweeg.protocols.splits import build_array_loso_fold
+        from eegda.protocols.splits import build_array_loso_fold
 
         arrays = self.get_data()
         fold = build_array_loso_fold(
