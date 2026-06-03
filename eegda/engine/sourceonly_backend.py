@@ -133,6 +133,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", default="eegnet")
     parser.add_argument("--method", default="source_only")
     parser.add_argument("--adaptation-protocol", choices=("none", "transductive", "inductive_split"), default="none")
+    parser.add_argument("--reuse-source", action="store_true")
+    parser.add_argument("--source-manifest", default=None)
+    parser.add_argument("--source-checkpoint-dir", default=None)
+    parser.add_argument("--require-source-checkpoint", action="store_true", default=True)
+    parser.add_argument("--no-require-source-checkpoint", action="store_false", dest="require_source_checkpoint")
+    parser.add_argument("--save-adapted-checkpoint", action="store_true", default=True)
+    parser.add_argument("--no-save-adapted-checkpoint", action="store_false", dest="save_adapted_checkpoint")
+    parser.add_argument("--adabn-reset-stats", action="store_true", default=True)
+    parser.add_argument("--no-adabn-reset-stats", action="store_false", dest="adabn_reset_stats")
+    parser.add_argument("--adabn-momentum", type=float, default=None)
+    parser.add_argument("--adabn-num-passes", type=int, default=1)
     parser.add_argument("--data-root", default="data/raw/SEED-VIG")
     parser.add_argument("--raw-data-dir", default=None)
     parser.add_argument("--label-dir", default=None)
@@ -220,6 +231,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def make_method(args: argparse.Namespace):
+    method_cls = get_method(args.method)
+    if args.method == "adabn":
+        return method_cls(
+            reset_stats=args.adabn_reset_stats,
+            momentum=args.adabn_momentum,
+            num_passes=args.adabn_num_passes,
+        )
+    return method_cls()
+
+
 def _argument_was_provided(argv: list[str], name: str) -> bool:
     return any(item == name or item.startswith(f"{name}=") for item in argv)
 
@@ -227,6 +249,8 @@ def _argument_was_provided(argv: list[str], name: str) -> bool:
 def resolve_protocol_defaults(args: argparse.Namespace) -> None:
     if args.dataset == "seedvig" and args.label_mode is None:
         args.label_mode = "threshold35"
+    if args.method == "adabn" and args.adaptation_protocol == "none":
+        args.adaptation_protocol = "transductive"
     if args.checkpoint_policy is None:
         args.checkpoint_policy = "last" if args.validation_mode == "none" else "best_val"
 
@@ -281,7 +305,10 @@ def main(argv: list[str] | None = None) -> None:
             console(args, f"Skipping target_subject={plan.target_subject}: existing prediction CSV and checkpoint found", "normal")
             continue
         try:
-            run_loso_fold(args, context, plan, device, repro_metadata, fold_index=idx, fold_total=len(plans))
+            if args.reuse_source:
+                run_reuse_source_fold(args, context, plan, device, repro_metadata, fold_index=idx, fold_total=len(plans))
+            else:
+                run_loso_fold(args, context, plan, device, repro_metadata, fold_index=idx, fold_total=len(plans))
         except Exception as exc:  # noqa: BLE001 - all-LOSO should continue after fold failures
             print(f"Fold target_subject={plan.target_subject} failed: {exc}")
             traceback.print_exc()
@@ -493,10 +520,18 @@ def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> Datase
 def validate_training_args(args: argparse.Namespace) -> None:
     register_builtin_components()
     get_method(args.method)
-    if args.method != "source_only":
-        raise ValueError("Only method='source_only' is implemented in Phase 0; no SFDA methods are available yet.")
-    if args.adaptation_protocol != "none":
-        raise ValueError("Only adaptation_protocol='none' is implemented in Phase 0.")
+    if args.method not in {"source_only", "adabn"}:
+        raise ValueError("Only method='source_only' and method='adabn' are implemented; no other SFDA methods are available yet.")
+    if args.method == "source_only" and args.adaptation_protocol != "none":
+        raise ValueError("source_only requires adaptation_protocol='none'.")
+    if args.method == "source_only" and args.reuse_source:
+        raise ValueError("--reuse-source is only valid for adaptation methods such as --method adabn")
+    if args.method == "adabn" and args.adaptation_protocol != "transductive":
+        raise ValueError("AdaBN requires adaptation_protocol='transductive'.")
+    if args.reuse_source and args.method != "source_only" and args.source_manifest is None and args.source_checkpoint_dir is None:
+        raise ValueError("--reuse-source requires --source-manifest or --source-checkpoint-dir")
+    if args.adabn_num_passes <= 0:
+        raise ValueError("--adabn-num-passes must be positive")
     if args.epochs <= 0:
         raise ValueError("--epochs must be positive")
     if args.batch_size <= 0:
@@ -580,8 +615,10 @@ def fold_outputs_exist(plan: FoldPlan) -> bool:
 def existing_checkpoints_for_plan(plan: FoldPlan) -> list[Path]:
     if not plan.outputs_enabled:
         return []
-    pattern = f"{plan.dataset}_{plan.model_name}_source_only_*_subject_{plan.target_subject}_seed*.pt"
-    return sorted(plan.checkpoint_path.parent.glob(pattern))
+    checkpoints = [plan.checkpoint_path] if plan.checkpoint_path.exists() else []
+    if plan.latest_checkpoint_path is not None and plan.latest_checkpoint_path.exists():
+        checkpoints.append(plan.latest_checkpoint_path)
+    return checkpoints
 
 
 def plan_seedvig_splits(args: argparse.Namespace, context: DatasetContext, target_subject: int):
@@ -650,8 +687,8 @@ def plan_loso_fold(
     created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     run_id = make_run_id(args, target_subject)
     checkpoints_dir = outputs_dir / "checkpoints"
-    output_stem = f"{context.dataset}_{context.model_name}_source_only_{context.label_protocol}_subject_{target_subject}"
-    summary_stem = f"{context.dataset}_{context.model_name}_source_only_{context.label_protocol}"
+    output_stem = f"{context.dataset}_{context.model_name}_{args.method}_{context.label_protocol}_subject_{target_subject}"
+    summary_stem = f"{context.dataset}_{context.model_name}_{args.method}_{context.label_protocol}"
     if args.output_layout in {"eegda", "droweeg"}:
         prediction_path = outputs_dir / "predictions" / f"{output_stem}.csv"
         summary_path = outputs_dir / "summaries" / f"{summary_stem}_summary.csv"
@@ -955,9 +992,19 @@ def run_loso_fold(
         if should_log(args, "verbose"):
             print_best_target_diagnostic_metrics(best_target_diagnostic_epoch, best_target_diagnostic_metrics)
     model.load_state_dict(selected_state)
-    method = get_method(args.method)()
+    method = make_method(args)
     target_unlabeled_loader = engine_trainer.make_unlabeled_loader(test, args.batch_size, args.num_workers, args.seed)
-    model = method.adapt(model, target_unlabeled_loader, ctx={"fold": plan, "adaptation_protocol": args.adaptation_protocol})
+    model = method.adapt(
+        model,
+        target_unlabeled_loader,
+        ctx={
+            "fold": plan,
+            "adaptation_protocol": args.adaptation_protocol,
+            "device": device,
+            "log_fn": (lambda message: console(args, message, "normal")),
+        },
+    )
+    method_diagnostics = method.diagnostics()
     if val is not None and plan.outputs_enabled:
         save_validation_subject_metrics(
             model,
@@ -984,12 +1031,27 @@ def run_loso_fold(
     if plan.outputs_enabled:
         save_predictions(plan.prediction_path, test, test_y, test_pred, test_probs, plan)
         save_predictions(report_prediction_path(plan), test, test_y, test_pred, test_probs, plan)
+        method_prediction_path, method_metrics_path = save_method_target_artifacts(
+            args,
+            plan,
+            test,
+            test_y,
+            test_pred,
+            test_probs,
+            test_metrics,
+        )
         save_epoch_metrics_report(plan, epoch_rows)
     checkpoint = {
         "run_id": plan.run_id,
         "created_at": plan.created_at,
+        "dataset_path": dataset_path_for_manifest(args),
         "dataset": plan.dataset,
+        "dataset_name": plan.dataset,
+        "protocol_name": plan.label_protocol,
         "model": plan.model_name,
+        "model_name": plan.model_name,
+        "method": args.method,
+        "adaptation_protocol": args.adaptation_protocol,
         "input_channels": plan.input_channels,
         "input_samples": plan.input_samples,
         "num_classes": plan.num_classes,
@@ -1003,6 +1065,7 @@ def run_loso_fold(
         "label_mode": args.label_mode,
         "target_subject": plan.target_subject,
         "target_subject_raw": plan.target_subject_raw,
+        "target_id_space": args.target_id_space,
         "seed": args.seed,
         "class_balance": args.class_balance,
         "loss_type": args.loss_type,
@@ -1035,9 +1098,62 @@ def run_loso_fold(
         },
         "final_metrics": serializable_metrics(test_metrics),
     }
+    adabn_checkpoint_path = adapted_checkpoint_path(plan, "adabn")
+    adabn_report = None
+    if args.method == "adabn":
+        adabn_report = {
+            **method_diagnostics,
+            "method": "adabn",
+            "source_checkpoint_path": str(plan.checkpoint_path),
+            "adapted_checkpoint_path": str(adabn_checkpoint_path),
+            "target_subject": plan.target_subject,
+            "target_subject_raw": plan.target_subject_raw,
+            "adaptation_protocol": args.adaptation_protocol,
+            "target_adaptation_mode": "target_test_unlabeled",
+            "target_labels_used_for_adaptation": False,
+            "target_labels_used_for_model_selection": False,
+            "target_labels_used_for_evaluation_only": True,
+        }
     if plan.outputs_enabled:
         plan.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(checkpoint, plan.checkpoint_path)
+        source_ckpt_path = save_source_fold_artifacts(
+            args,
+            plan,
+            checkpoint,
+            preprocess_state,
+            class_weights,
+            train["y"],
+            epoch_rows,
+            best_epoch=None if val_loader is None else best_epoch,
+            best_val_metric=np.nan if val_loader is None else best_monitor,
+            selected_epoch=selected_epoch,
+            selected_reason=selected_reason,
+        )
+        if args.method == "adabn":
+            adabn_report["source_checkpoint_path"] = str(source_ckpt_path)
+            adabn_report["adapted_checkpoint_path"] = str(adabn_checkpoint_path) if args.save_adapted_checkpoint else ""
+            adapted_checkpoint = {
+                **checkpoint,
+                "model_state_dict": engine_checkpointing.copy_model_state(model),
+                "source_checkpoint_path": str(source_ckpt_path),
+                "adapted_checkpoint_path": str(adabn_checkpoint_path),
+                "adabn_report": adabn_report,
+            }
+            if args.save_adapted_checkpoint:
+                torch.save(adapted_checkpoint, adabn_checkpoint_path)
+            write_json(adabn_report_path(plan), adabn_report)
+            write_adaptation_manifest_row(
+                adaptation_manifest_path(plan),
+                args,
+                plan,
+                source_checkpoint_path=source_ckpt_path,
+                adapted_checkpoint_path_value=adabn_checkpoint_path if args.save_adapted_checkpoint else None,
+                prediction_path=method_prediction_path,
+                metrics_path=method_metrics_path,
+                adaptation_report_path=adabn_report_path(plan),
+                target_samples_used=int(adabn_report.get("target_samples_used", 0)),
+            )
         if plan.latest_checkpoint_path is not None:
             plan.latest_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(checkpoint, plan.latest_checkpoint_path)
@@ -1074,10 +1190,26 @@ def run_loso_fold(
                 "artifacts": fold_artifacts(plan),
                 "selected_epoch": selected_epoch,
                 "selected_reason": selected_reason,
+                "method_diagnostics": method_diagnostics,
                 "confusion_matrix": np.asarray(test_metrics["confusion_matrix"]).tolist(),
                 "final_metrics": serializable_metrics(test_metrics),
             }
         )
+        if args.method == "adabn" and adabn_report is not None:
+            fold_audit.update(
+                {
+                    "adaptation_protocol": args.adaptation_protocol,
+                    "target_unlabeled_used_for_adaptation": True,
+                    "target_bn_stats_recomputed_on_target": bool(adabn_report.get("bn_running_stats_changed")),
+                    "target_labels_used_for_adaptation": False,
+                    "target_labels_used_for_model_selection": False,
+                    "target_labels_used_for_evaluation_only": True,
+                    "adaptation_eval_split": "same_as_adaptation",
+                    "adaptation_report_path": str(adabn_report_path(plan)),
+                    "adapted_checkpoint_path": str(adabn_checkpoint_path),
+                    "adaptation": adabn_report,
+                }
+            )
         save_fold_audit(plan, fold_audit)
         update_aggregate_metrics_report(plan)
         update_artifacts_report(plan)
@@ -1093,6 +1225,206 @@ def run_loso_fold(
             console(args, f"Saved target diagnostic metrics: {plan.test_metrics_path}", "debug")
     else:
         console(args, "Output saving disabled: --output-dir none", "debug")
+
+
+def run_reuse_source_fold(
+    args: argparse.Namespace,
+    context: DatasetContext,
+    plan: FoldPlan,
+    device: torch.device,
+    repro_metadata: dict[str, object],
+    *,
+    fold_index: int,
+    fold_total: int,
+) -> None:
+    if args.method == "source_only":
+        raise ValueError("reuse-source mode is only valid for adaptation methods")
+    set_seed(args.seed, deterministic=args.deterministic)
+    guard_reuse_outputs(args, plan)
+    write_fold_report(args, context, plan)
+    if should_log(args, "normal"):
+        print_compact_fold_start(plan, fold_index, fold_total, dry_run=False)
+
+    source_row = find_source_checkpoint_row(args, context, plan)
+    if source_row is None:
+        message = f"No source checkpoint found for target_subject={plan.target_subject}"
+        if args.require_source_checkpoint:
+            raise FileNotFoundError(message)
+        console(args, f"[WARN] {message}; skipping fold.", "normal")
+        return
+
+    source_checkpoint = Path(str(source_row["checkpoint_path"]))
+    normalization_path = Path(str(source_row["normalization_stats_path"]))
+    split_path = Path(str(source_row["split_info_path"]))
+    class_weight_path = Path(str(source_row["class_weights_path"]))
+    if should_log(args, "normal"):
+        print(f"Loaded source checkpoint: {source_checkpoint}")
+        print(f"Loaded normalization statistics: {normalization_path}")
+        print(f"Loaded split info: {split_path}")
+        print("")
+
+    test, _test_sessions = load_target_arrays(args, context, plan)
+    preprocess_state = load_normalization_stats(normalization_path)
+    test["x"] = engine_trainer.preprocess_target(test["x"], preprocess_state)
+    test_loader = engine_trainer.make_loader(
+        test,
+        args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        seed=args.seed,
+    )
+    target_unlabeled_loader = engine_trainer.make_unlabeled_loader(test, args.batch_size, args.num_workers, args.seed)
+
+    checkpoint = torch.load(source_checkpoint, map_location="cpu", weights_only=False)
+    model_config = checkpoint.get("model_config") or eegnet_model_config(args, context)
+    set_seed(args.seed, deterministic=args.deterministic)
+    model = build_model(args.model, context.input_channels, context.input_samples, context.num_classes, args).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    method = make_method(args)
+    model = method.adapt(
+        model,
+        target_unlabeled_loader,
+        ctx={
+            "fold": plan,
+            "adaptation_protocol": args.adaptation_protocol,
+            "device": device,
+            "log_fn": (lambda message: console(args, message, "normal")),
+        },
+    )
+    method_diagnostics = method.diagnostics()
+    target_eval = engine_evaluator.evaluate_target(model, test_loader, device)
+    test_y = target_eval["y_true"]
+    test_probs = target_eval["probs"]
+    test_pred = target_eval["y_pred"]
+    test_metrics = target_eval["metrics"]
+    print_fold_result(args, test_metrics, plan)
+
+    selected_epoch = int(checkpoint.get("selected_epoch", source_row.get("selected_epoch", source_row.get("best_epoch", 0))))
+    selected_reason = str(checkpoint.get("selected_reason", source_row.get("selected_reason", "source_manifest")))
+    best_epoch = checkpoint.get("best_epoch", source_row.get("best_epoch", selected_epoch))
+    best_val_metric = source_row.get("val_metric_value", source_row.get("best_val_metric", np.nan))
+    class_weights = load_class_weights_for_reuse(class_weight_path)
+
+    if plan.outputs_enabled:
+        save_predictions(plan.prediction_path, test, test_y, test_pred, test_probs, plan)
+        save_predictions(report_prediction_path(plan), test, test_y, test_pred, test_probs, plan)
+        method_prediction_path, method_metrics_path = save_method_target_artifacts(
+            args,
+            plan,
+            test,
+            test_y,
+            test_pred,
+            test_probs,
+            test_metrics,
+        )
+        fold_dir = fold_artifact_dir(plan)
+        fold_dir.mkdir(parents=True, exist_ok=True)
+        (fold_dir / "source_checkpoint_used.txt").write_text(str(source_checkpoint) + "\n", encoding="utf-8")
+        adabn_ckpt_path = adapted_checkpoint_path(plan, args.method)
+        adabn_report = {
+            **method_diagnostics,
+            "method": args.method,
+            "source_checkpoint_path": str(source_checkpoint),
+            "adapted_checkpoint_path": str(adabn_ckpt_path) if args.save_adapted_checkpoint else "",
+            "target_subject": plan.target_subject,
+            "target_subject_raw": plan.target_subject_raw,
+            "adaptation_protocol": args.adaptation_protocol,
+            "target_adaptation_mode": "target_test_unlabeled",
+            "target_labels_used_for_adaptation": False,
+            "target_labels_used_for_model_selection": False,
+            "target_labels_used_for_evaluation_only": True,
+        }
+        if args.save_adapted_checkpoint:
+            adabn_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    **checkpoint,
+                    "model_state_dict": engine_checkpointing.copy_model_state(model),
+                    "source_checkpoint_path": str(source_checkpoint),
+                    "adapted_checkpoint_path": str(adabn_ckpt_path),
+                    "adabn_report": adabn_report,
+                },
+                adabn_ckpt_path,
+            )
+        write_json(adabn_report_path(plan), adabn_report)
+        write_json(fold_dir / "adaptation_report.json", adabn_report)
+        save_success_summary_row(
+            plan.summary_path,
+            args=args,
+            plan=plan,
+            metrics=test_metrics,
+            class_weights=class_weights,
+            best_epoch=None if is_nan_like(best_epoch) else int(float(best_epoch)),
+            best_macro_f1=np.nan,
+            best_balanced_acc=np.nan,
+            best_monitor=float(best_val_metric) if not is_nan_like(best_val_metric) else np.nan,
+            selected_epoch=selected_epoch,
+            selected_reason=selected_reason,
+        )
+        write_checkpoint_manifest_row(
+            plan.manifest_path,
+            args,
+            plan,
+            status="success",
+            best_epoch=selected_epoch,
+            best_val_metric=float(best_val_metric) if not is_nan_like(best_val_metric) else np.nan,
+            error="",
+        )
+        write_adaptation_manifest_row(
+            adaptation_manifest_path(plan),
+            args,
+            plan,
+            source_checkpoint_path=source_checkpoint,
+            adapted_checkpoint_path_value=adabn_ckpt_path if args.save_adapted_checkpoint else None,
+            prediction_path=method_prediction_path,
+            metrics_path=method_metrics_path,
+            adaptation_report_path=adabn_report_path(plan),
+            target_samples_used=int(adabn_report.get("target_samples_used", 0)),
+        )
+        save_fold_reporting(args, plan, test_metrics, selected_epoch, selected_reason)
+        fold_audit = {
+            "target_subject": plan.target_subject,
+            "target_subject_raw": plan.target_subject_raw,
+            "train_subject_ids": plan.train_subject_ids,
+            "train_subject_raw_ids": plan.train_subject_raw_ids,
+            "val_subject_ids": plan.val_subject_ids,
+            "val_subject_raw_ids": plan.val_subject_raw_ids,
+            "test_subject_ids": plan.test_subject_ids,
+            "test_subject_raw_ids": plan.test_subject_raw_ids,
+            "validation_mode": args.validation_mode,
+            "checkpoint_policy": args.checkpoint_policy,
+            "counts": {"train": plan.train_counts, "val": plan.val_counts, "test": plan.test_counts},
+            "reuse_source": True,
+            "source_checkpoint_path": str(source_checkpoint),
+            "normalization_stats_path": str(normalization_path),
+            "split_info_path": str(split_path),
+            "class_weights_path": str(class_weight_path),
+            "preprocessing": {
+                "normalization_source": "loaded_source_training_only",
+                "robust_clipping": bool(preprocess_state["clip_bounds"] is not None),
+                "post_preprocess_nan_inf": audit_nan_inf(test=test),
+            },
+            "artifacts": fold_artifacts(plan),
+            "selected_epoch": selected_epoch,
+            "selected_reason": selected_reason,
+            "method_diagnostics": method_diagnostics,
+            "confusion_matrix": np.asarray(test_metrics["confusion_matrix"]).tolist(),
+            "final_metrics": serializable_metrics(test_metrics),
+            "adaptation_protocol": args.adaptation_protocol,
+            "target_unlabeled_used_for_adaptation": True,
+            "target_bn_stats_recomputed_on_target": bool(adabn_report.get("bn_running_stats_changed")),
+            "target_labels_used_for_adaptation": False,
+            "target_labels_used_for_model_selection": False,
+            "target_labels_used_for_evaluation_only": True,
+            "adaptation_eval_split": "same_as_adaptation",
+            "adaptation_report_path": str(adabn_report_path(plan)),
+            "adapted_checkpoint_path": str(adabn_ckpt_path) if args.save_adapted_checkpoint else "",
+            "adaptation": adabn_report,
+        }
+        save_fold_audit(plan, fold_audit)
+        update_aggregate_metrics_report(plan)
+        update_artifacts_report(plan)
 
 
 def write_fold_report(args: argparse.Namespace, context: DatasetContext, plan: FoldPlan) -> None:
@@ -1221,6 +1553,99 @@ def load_fold_arrays(
     return train, val, test, [], [], []
 
 
+def load_target_arrays(
+    args: argparse.Namespace,
+    context: DatasetContext,
+    plan: FoldPlan,
+) -> tuple[dict[str, np.ndarray], list]:
+    if context.dataset == "seedvig":
+        test_sessions = load_seedvig_file_pairs(plan.test_pairs, label_mode=args.label_mode, bandpass=args.bandpass)
+        return sessions_to_arrays(test_sessions), test_sessions
+    if context.sadt_arrays is None:
+        raise ValueError("Array dataset is not loaded")
+    return subset_by_subject(context.sadt_arrays, plan.target_subject, include=True), []
+
+
+def resolve_source_manifest_path(args: argparse.Namespace) -> Path:
+    if args.source_manifest is not None:
+        return Path(args.source_manifest)
+    if args.source_checkpoint_dir is None:
+        raise ValueError("--source-manifest or --source-checkpoint-dir is required in reuse-source mode")
+    root = Path(args.source_checkpoint_dir)
+    candidates = [
+        root / "checkpoint_manifest.csv",
+        root / "checkpoints" / "checkpoints_manifest.csv",
+        root / "checkpoints_manifest.csv",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"No checkpoint manifest found under {root}")
+
+
+def find_source_checkpoint_row(
+    args: argparse.Namespace,
+    context: DatasetContext,
+    plan: FoldPlan,
+) -> pd.Series | None:
+    manifest_path = resolve_source_manifest_path(args)
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Source manifest does not exist: {manifest_path}")
+    manifest = pd.read_csv(manifest_path)
+    if manifest.empty:
+        raise ValueError(f"Source manifest is empty: {manifest_path}")
+    mask = pd.Series([True] * len(manifest))
+    if "method" in manifest.columns:
+        mask &= manifest["method"].astype(str) == "source_only"
+    model_col = "model_name" if "model_name" in manifest.columns else "model"
+    if model_col in manifest.columns:
+        mask &= manifest[model_col].astype(str) == str(plan.model_name)
+    if "seed" in manifest.columns:
+        mask &= pd.to_numeric(manifest["seed"], errors="coerce") == int(args.seed)
+    if "target_subject" in manifest.columns:
+        mask &= pd.to_numeric(manifest["target_subject"], errors="coerce") == int(plan.target_subject)
+    protocol_cols = [col for col in ("protocol_name", "label_protocol") if col in manifest.columns]
+    if protocol_cols:
+        protocol_mask = pd.Series([False] * len(manifest))
+        for col in protocol_cols:
+            protocol_mask |= manifest[col].astype(str) == str(plan.label_protocol)
+        mask &= protocol_mask
+    rows = manifest.loc[mask].copy()
+    if rows.empty:
+        return None
+    if len(rows) > 1:
+        raise ValueError(
+            f"Multiple source checkpoints match target_subject={plan.target_subject} in {manifest_path}. "
+            "Use a manifest with unique rows for this benchmark run."
+        )
+    row = rows.iloc[0]
+    required = ["checkpoint_path", "normalization_stats_path", "split_info_path", "class_weights_path"]
+    missing = [col for col in required if col not in row.index or pd.isna(row[col]) or str(row[col]) == ""]
+    if missing:
+        raise ValueError(f"Source manifest row is missing required columns: {missing}")
+    for col in required:
+        if not Path(str(row[col])).exists():
+            raise FileNotFoundError(f"Manifest column {col} points to a missing file: {row[col]}")
+    return row
+
+
+def load_class_weights_for_reuse(path: str | Path) -> np.ndarray | None:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    weights = payload.get("class_weights")
+    if weights is None:
+        return None
+    return np.asarray(weights, dtype=np.float32)
+
+
+def is_nan_like(value: object) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(np.isnan(float(value)))
+    except (TypeError, ValueError):
+        return False
+
+
 def choose_device(requested: str) -> torch.device:
     if requested == "auto":
         if torch.cuda.is_available():
@@ -1270,6 +1695,50 @@ def report_prediction_path(plan: FoldPlan) -> Path:
     return run_dir(plan) / "predictions" / f"fold_{plan.target_subject}.csv"
 
 
+def fold_artifact_dir(plan: FoldPlan) -> Path:
+    return run_dir(plan) / f"fold_subject_{plan.target_subject}"
+
+
+def fold_source_checkpoint_path(plan: FoldPlan) -> Path:
+    return fold_artifact_dir(plan) / "source_checkpoint.pt"
+
+
+def fold_config_path(plan: FoldPlan) -> Path:
+    return fold_artifact_dir(plan) / "fold_config.json"
+
+
+def split_info_path(plan: FoldPlan) -> Path:
+    return fold_artifact_dir(plan) / "split_info.json"
+
+
+def normalization_stats_path(plan: FoldPlan) -> Path:
+    return fold_artifact_dir(plan) / "normalization_stats.npz"
+
+
+def class_weights_path(plan: FoldPlan) -> Path:
+    return fold_artifact_dir(plan) / "class_weights.json"
+
+
+def train_log_path(plan: FoldPlan) -> Path:
+    return fold_artifact_dir(plan) / "train_log.csv"
+
+
+def fold_target_predictions_path(plan: FoldPlan, method_name: str) -> Path:
+    return fold_artifact_dir(plan) / f"target_predictions_{method_name}.csv"
+
+
+def fold_target_metrics_path(plan: FoldPlan, method_name: str) -> Path:
+    return fold_artifact_dir(plan) / f"target_metrics_{method_name}.json"
+
+
+def source_checkpoint_manifest_path(plan: FoldPlan) -> Path:
+    return run_dir(plan) / "checkpoint_manifest.csv"
+
+
+def adaptation_manifest_path(plan: FoldPlan) -> Path:
+    return run_dir(plan) / "adaptation_manifest.csv"
+
+
 def epoch_metrics_report_path(plan: FoldPlan) -> Path:
     return run_dir(plan) / "metrics" / f"epoch_metrics_fold_{plan.target_subject}.csv"
 
@@ -1286,9 +1755,44 @@ def split_audit_report_path(plan: FoldPlan) -> Path:
     return run_dir(plan) / "split_audit" / f"fold_{plan.target_subject}.json"
 
 
+def adabn_report_path(plan: FoldPlan) -> Path:
+    return run_dir(plan) / "reports" / f"adabn_report_subject_{plan.target_subject}.json"
+
+
+def adapted_checkpoint_path(plan: FoldPlan, method_name: str) -> Path:
+    return plan.checkpoint_path.with_name(plan.checkpoint_path.stem + f"_{method_name}_adapted.pt")
+
+
 def write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(jsonable(payload), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def save_normalization_stats(path: Path, preprocess_state: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    clip_bounds = preprocess_state.get("clip_bounds")
+    payload = {
+        "mean": np.asarray(preprocess_state["mean"], dtype=np.float32),
+        "std": np.asarray(preprocess_state["std"], dtype=np.float32),
+        "robust_clip": np.asarray(clip_bounds is not None),
+    }
+    if clip_bounds is not None:
+        lo, hi = clip_bounds
+        payload["clip_low"] = np.asarray(lo, dtype=np.float32)
+        payload["clip_high"] = np.asarray(hi, dtype=np.float32)
+    np.savez(path, **payload)
+
+
+def load_normalization_stats(path: str | Path) -> dict[str, object]:
+    with np.load(path, allow_pickle=True) as data:
+        clip_bounds = None
+        if bool(np.asarray(data.get("robust_clip", False)).item()):
+            clip_bounds = (np.asarray(data["clip_low"], dtype=np.float32), np.asarray(data["clip_high"], dtype=np.float32))
+        return {
+            "mean": np.asarray(data["mean"], dtype=np.float32),
+            "std": np.asarray(data["std"], dtype=np.float32),
+            "clip_bounds": clip_bounds,
+        }
 
 
 def jsonable(value):
@@ -1323,6 +1827,18 @@ def write_run_reports(
             "cli_args": vars(args),
             "dataset": context.dataset,
             "model": context.model_name,
+            "method": args.method,
+            "adaptation_protocol": args.adaptation_protocol,
+            "reuse_source": args.reuse_source,
+            "source_manifest": args.source_manifest,
+            "source_checkpoint_dir": args.source_checkpoint_dir,
+            "require_source_checkpoint": args.require_source_checkpoint,
+            "save_adapted_checkpoint": args.save_adapted_checkpoint,
+            "adabn": {
+                "reset_stats": args.adabn_reset_stats,
+                "momentum": args.adabn_momentum,
+                "num_passes": args.adabn_num_passes,
+            },
             "label_protocol": context.label_protocol,
             "input_channels": context.input_channels,
             "input_samples": context.input_samples,
@@ -1349,9 +1865,14 @@ def write_run_reports(
             "checkpoint_policy": args.checkpoint_policy,
             "method": args.method,
             "adaptation_protocol": args.adaptation_protocol,
+            "reuse_source": args.reuse_source,
+            "source_manifest": args.source_manifest,
+            "source_checkpoint_dir": args.source_checkpoint_dir,
             "early_stop_enabled": early_stop_enabled(args),
             "monitor_metric": args.monitor_metric,
             "target_labels_for_model_selection": False,
+            "target_unlabeled_used_for_adaptation": args.method == "adabn",
+            "target_bn_stats_recomputed_on_target": args.method == "adabn",
             "target_labels_used_for_adaptation": False,
             "target_labels_used_for_model_selection": False,
             "target_labels_used_for_evaluation_only": True,
@@ -1372,7 +1893,8 @@ def print_run_overview(
     print("EEGDA Benchmark Run")
     print("-" * 21)
     print(f"Dataset        : {context.dataset}")
-    print("Protocol       : LOSO source-only")
+    method_label = "source-only" if args.method == "source_only" else "AdaBN source-free"
+    print(f"Protocol       : LOSO {method_label}")
     print(f"Model          : {'EEGNet' if context.model_name == 'eegnet' else context.model_name}")
     print(f"Subjects       : {len(context.subjects)} available, {len(target_subjects)} selected")
     print(f"Selected       : {format_selected_targets(context, target_subjects)}")
@@ -1382,6 +1904,8 @@ def print_run_overview(
     print(f"Class balance  : {loss_label(args)}")
     print(f"Validation     : {args.validation_mode}")
     print(f"Checkpoint     : {checkpoint_label(args)}")
+    if args.reuse_source:
+        print("Source model   : reused from manifest")
     print(f"Device         : {device}")
     print(f"Seed           : {args.seed}")
     print(f"Output dir     : {output_dir}")
@@ -1389,6 +1913,10 @@ def print_run_overview(
     print("Protocol checks")
     print("[OK] Target labels are not used for model selection.")
     print("[OK] Normalization statistics are computed from source training data only.")
+    if args.method == "adabn":
+        print("[OK] AdaBN uses unlabeled target data only and updates BatchNorm running statistics only.")
+        if args.reuse_source:
+            print("[OK] Source training is skipped; fold source checkpoints are loaded from the source manifest.")
     if args.validation_mode == "none":
         print(f"[WARN] No validation set is used; checkpoint_policy={args.checkpoint_policy} will be used.")
     if context.dataset != "seedvig" and getattr(args, "label_mode_explicit", False):
@@ -1622,6 +2150,11 @@ def training_config(args: argparse.Namespace) -> dict[str, object]:
         "checkpoint_policy": args.checkpoint_policy,
         "fixed_eval_epoch": args.fixed_eval_epoch,
         "test_every_epochs": args.test_every_epochs,
+        "method": args.method,
+        "adaptation_protocol": args.adaptation_protocol,
+        "adabn_reset_stats": args.adabn_reset_stats,
+        "adabn_momentum": args.adabn_momentum,
+        "adabn_num_passes": args.adabn_num_passes,
         "min_delta": args.min_delta,
         "monitor_metric": args.monitor_metric,
     }
@@ -1757,6 +2290,102 @@ def save_predictions(path: Path, arrays: dict[str, np.ndarray], y_true, y_pred, 
     df.to_csv(path, index=False)
 
 
+def save_source_fold_artifacts(
+    args: argparse.Namespace,
+    plan: FoldPlan,
+    checkpoint: dict[str, object],
+    preprocess_state: dict[str, object],
+    class_weights: np.ndarray | None,
+    train_y: np.ndarray,
+    epoch_rows: list[dict[str, object]],
+    *,
+    best_epoch: int | None,
+    best_val_metric: float | None,
+    selected_epoch: int,
+    selected_reason: str,
+) -> Path:
+    fold_dir = fold_artifact_dir(plan)
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    source_ckpt = fold_source_checkpoint_path(plan)
+    torch.save(checkpoint, source_ckpt)
+    write_json(
+        fold_config_path(plan),
+        {
+            "run_id": plan.run_id,
+            "dataset": plan.dataset,
+            "model": plan.model_name,
+            "method": "source_only",
+            "label_protocol": plan.label_protocol,
+            "target_subject": plan.target_subject,
+            "target_subject_raw": plan.target_subject_raw,
+            "seed": args.seed,
+            "validation_mode": args.validation_mode,
+            "checkpoint_policy": args.checkpoint_policy,
+            "monitor_metric": args.monitor_metric,
+            "best_epoch": best_epoch,
+            "best_val_metric": best_val_metric,
+            "selected_epoch": selected_epoch,
+            "selected_reason": selected_reason,
+        },
+    )
+    write_json(
+        split_info_path(plan),
+        {
+            "target_subject": plan.target_subject,
+            "target_subject_raw": plan.target_subject_raw,
+            "target_id_space": args.target_id_space,
+            "train_subjects": plan.train_subject_ids,
+            "train_subject_raw_ids": plan.train_subject_raw_ids,
+            "val_subjects": plan.val_subject_ids,
+            "val_subject_raw_ids": plan.val_subject_raw_ids,
+            "test_subjects": plan.test_subject_ids,
+            "test_subject_raw_ids": plan.test_subject_raw_ids,
+            "train_counts": plan.train_counts,
+            "val_counts": plan.val_counts,
+            "test_counts": plan.test_counts,
+            "validation_mode": args.validation_mode,
+            "validation_strategy": plan.validation_strategy,
+        },
+    )
+    save_normalization_stats(normalization_stats_path(plan), preprocess_state)
+    write_json(
+        class_weights_path(plan),
+        {
+            "class_balance": args.class_balance,
+            "class_weights": None if class_weights is None else class_weights.tolist(),
+            "source_train_counts": np.bincount(np.asarray(train_y, dtype=np.int64), minlength=2).tolist(),
+        },
+    )
+    pd.DataFrame(epoch_rows).to_csv(train_log_path(plan), index=False)
+    write_source_checkpoint_manifest_row(
+        source_checkpoint_manifest_path(plan),
+        args,
+        plan,
+        checkpoint_path=source_ckpt,
+        best_epoch=best_epoch,
+        best_val_metric=best_val_metric,
+        selected_epoch=selected_epoch,
+        selected_reason=selected_reason,
+    )
+    return source_ckpt
+
+
+def save_method_target_artifacts(
+    args: argparse.Namespace,
+    plan: FoldPlan,
+    test: dict[str, np.ndarray],
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    probs: np.ndarray,
+    metrics: dict[str, object],
+) -> tuple[Path, Path]:
+    prediction_path = fold_target_predictions_path(plan, args.method)
+    metrics_path = fold_target_metrics_path(plan, args.method)
+    save_predictions(prediction_path, test, y_true, y_pred, probs, plan)
+    write_json(metrics_path, serializable_metrics(metrics))
+    return prediction_path, metrics_path
+
+
 def first_raw_subject(arrays: dict[str, np.ndarray], mask: np.ndarray) -> object:
     raw_subjects = arrays.get("subject_id_raw", arrays["subject_id"])
     return python_scalar(raw_subjects[np.flatnonzero(mask)[0]])
@@ -1769,6 +2398,17 @@ def guard_run_outputs(args: argparse.Namespace, plan: FoldPlan) -> None:
         raise FileExistsError(f"Checkpoint already exists: {plan.checkpoint_path}. Use --overwrite to replace it.")
     if manifest_has_run_id(plan.manifest_path, plan.run_id) and not args.overwrite:
         raise FileExistsError(f"Run ID already exists in manifest: {plan.run_id}. Use --overwrite to replace it.")
+
+
+def guard_reuse_outputs(args: argparse.Namespace, plan: FoldPlan) -> None:
+    if not plan.outputs_enabled:
+        return
+    outputs = [plan.prediction_path, fold_target_metrics_path(plan, args.method), fold_target_predictions_path(plan, args.method)]
+    if args.save_adapted_checkpoint:
+        outputs.append(adapted_checkpoint_path(plan, args.method))
+    existing = [path for path in outputs if path.exists()]
+    if existing and not args.overwrite:
+        raise FileExistsError(f"Reuse-source output already exists: {existing[0]}. Use --overwrite to replace it.")
 
 
 def manifest_has_run_id(path: Path, run_id: str) -> bool:
@@ -1844,15 +2484,30 @@ def save_epoch_metrics_report(plan: FoldPlan, rows: list[dict[str, object]]) -> 
 
 
 def fold_artifacts(plan: FoldPlan) -> dict[str, str]:
-    return {
+    artifacts = {
         "prediction_path": str(plan.prediction_path),
         "standard_prediction_path": str(report_prediction_path(plan)),
         "checkpoint_path": str(plan.checkpoint_path),
+        "fold_dir": str(fold_artifact_dir(plan)),
+        "source_checkpoint_path": str(fold_source_checkpoint_path(plan)),
+        "normalization_stats_path": str(normalization_stats_path(plan)),
+        "split_info_path": str(split_info_path(plan)),
+        "class_weights_path": str(class_weights_path(plan)),
+        "train_log_path": str(train_log_path(plan)),
         "summary_path": str(plan.summary_path),
         "manifest_path": str(plan.manifest_path),
+        "source_checkpoint_manifest_path": str(source_checkpoint_manifest_path(plan)),
+        "adaptation_manifest_path": str(adaptation_manifest_path(plan)),
         "epoch_metrics_path": str(epoch_metrics_report_path(plan)),
         "fold_audit_path": str(split_audit_report_path(plan)),
     }
+    adabn_ckpt = adapted_checkpoint_path(plan, "adabn")
+    adabn_report = adabn_report_path(plan)
+    if adabn_ckpt.exists():
+        artifacts["adapted_checkpoint_path"] = str(adabn_ckpt)
+    if adabn_report.exists():
+        artifacts["adabn_report_path"] = str(adabn_report)
+    return artifacts
 
 
 def save_fold_audit(plan: FoldPlan, payload: dict[str, object]) -> None:
@@ -1871,6 +2526,7 @@ def save_fold_reporting(
         "run_id": plan.run_id,
         "dataset": plan.dataset,
         "model": plan.model_name,
+        "method": args.method,
         "label_protocol": plan.label_protocol,
         "target_subject": plan.target_subject,
         "target_subject_raw": plan.target_subject_raw,
@@ -1950,6 +2606,8 @@ def update_artifacts_report(plan: FoldPlan) -> None:
             "checkpoints_dir": root / "checkpoints",
             "summaries_dir": root / "summaries",
             "reports_dir": root / "reports",
+            "source_checkpoint_manifest": root / "checkpoint_manifest.csv",
+            "adaptation_manifest": root / "adaptation_manifest.csv",
         },
     )
 
@@ -2117,7 +2775,7 @@ def save_success_summary_row(
         "confusion_matrix": metrics["confusion_matrix"].tolist(),
     }
     upsert_summary_row(path, row)
-    write_overall_metrics(path, plan.dataset, plan.model_name, plan.label_protocol)
+    write_overall_metrics(path, plan.dataset, plan.model_name, plan.label_protocol, args.method)
 
 
 def write_failed_summary_row(path: Path, args: argparse.Namespace, plan: FoldPlan, exc: Exception) -> None:
@@ -2154,6 +2812,8 @@ def write_checkpoint_manifest_row(
         "created_at": plan.created_at,
         "dataset": plan.dataset,
         "model": plan.model_name,
+        "method": args.method,
+        "adaptation_protocol": args.adaptation_protocol,
         "input_channels": plan.input_channels,
         "input_samples": plan.input_samples,
         "num_classes": plan.num_classes,
@@ -2195,6 +2855,12 @@ def write_checkpoint_manifest_row(
         "eegnet_dropout": args.eegnet_dropout,
         "eegnet_norm_rate": args.eegnet_norm_rate,
         "checkpoint_path": str(plan.checkpoint_path),
+        "fold_dir": str(fold_artifact_dir(plan)),
+        "source_checkpoint_path": str(fold_source_checkpoint_path(plan)),
+        "normalization_stats_path": str(normalization_stats_path(plan)),
+        "split_info_path": str(split_info_path(plan)),
+        "class_weights_path": str(class_weights_path(plan)),
+        "adapted_checkpoint_path": str(adapted_checkpoint_path(plan, "adabn")) if args.method == "adabn" else "",
         "prediction_csv_path": str(plan.prediction_path),
         "summary_path": str(plan.summary_path),
         "command": plan.command,
@@ -2220,7 +2886,121 @@ def write_checkpoint_manifest_row(
     manifest.to_csv(path, index=False)
 
 
-def write_overall_metrics(summary_path: Path, dataset: str, model_name: str, label_protocol: str) -> None:
+def dataset_path_for_manifest(args: argparse.Namespace) -> str:
+    if args.dataset == "standard-npz":
+        return "" if args.standard_npz_path is None else str(args.standard_npz_path)
+    if args.dataset == "sadt":
+        return str(args.sadt_path)
+    if args.raw_data_dir is not None and args.label_dir is not None:
+        return f"raw_data_dir={args.raw_data_dir};label_dir={args.label_dir}"
+    return str(args.data_root)
+
+
+def write_source_checkpoint_manifest_row(
+    path: Path,
+    args: argparse.Namespace,
+    plan: FoldPlan,
+    *,
+    checkpoint_path: Path,
+    best_epoch: int | None,
+    best_val_metric: float | None,
+    selected_epoch: int,
+    selected_reason: str,
+) -> None:
+    row = {
+        "run_id": plan.run_id,
+        "dataset_path": dataset_path_for_manifest(args),
+        "dataset_name": plan.dataset,
+        "protocol_name": plan.label_protocol,
+        "label_protocol": plan.label_protocol,
+        "model_name": plan.model_name,
+        "method": "source_only",
+        "seed": args.seed,
+        "target_subject": plan.target_subject,
+        "target_subject_raw": plan.target_subject_raw,
+        "target_id_space": args.target_id_space,
+        "fold_dir": str(fold_artifact_dir(plan)),
+        "checkpoint_path": str(checkpoint_path),
+        "legacy_checkpoint_path": str(plan.checkpoint_path),
+        "normalization_stats_path": str(normalization_stats_path(plan)),
+        "split_info_path": str(split_info_path(plan)),
+        "class_weights_path": str(class_weights_path(plan)),
+        "fold_config_path": str(fold_config_path(plan)),
+        "train_log_path": str(train_log_path(plan)),
+        "checkpoint_policy": args.checkpoint_policy,
+        "monitor_metric": args.monitor_metric,
+        "best_epoch": best_epoch,
+        "selected_epoch": selected_epoch,
+        "selected_reason": selected_reason,
+        "val_metric_value": best_val_metric,
+        "train_subjects": json.dumps(plan.train_subject_ids),
+        "train_subject_raw_ids": json.dumps(jsonable(plan.train_subject_raw_ids)),
+        "val_subjects": json.dumps(plan.val_subject_ids),
+        "val_subject_raw_ids": json.dumps(jsonable(plan.val_subject_raw_ids)),
+        "test_subjects": json.dumps(plan.test_subject_ids),
+        "test_subject_raw_ids": json.dumps(jsonable(plan.test_subject_raw_ids)),
+        "created_at": plan.created_at,
+    }
+    upsert_manifest_row(path, row, key_cols=["run_id"])
+
+
+def write_adaptation_manifest_row(
+    path: Path,
+    args: argparse.Namespace,
+    plan: FoldPlan,
+    *,
+    source_checkpoint_path: Path,
+    adapted_checkpoint_path_value: Path | None,
+    prediction_path: Path,
+    metrics_path: Path,
+    adaptation_report_path: Path,
+    target_samples_used: int,
+) -> None:
+    row = {
+        "run_id": plan.run_id,
+        "method": args.method,
+        "protocol_name": plan.label_protocol,
+        "label_protocol": plan.label_protocol,
+        "model_name": plan.model_name,
+        "seed": args.seed,
+        "target_subject": plan.target_subject,
+        "target_subject_raw": plan.target_subject_raw,
+        "source_checkpoint_path": str(source_checkpoint_path),
+        "adapted_checkpoint_path": "" if adapted_checkpoint_path_value is None else str(adapted_checkpoint_path_value),
+        "prediction_path": str(prediction_path),
+        "metrics_path": str(metrics_path),
+        "adaptation_report_path": str(adaptation_report_path),
+        "target_samples_used": target_samples_used,
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    upsert_manifest_row(path, row, key_cols=["method", "seed", "target_subject"])
+
+
+def upsert_manifest_row(path: Path, row: dict[str, object], *, key_cols: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_row = pd.DataFrame([row])
+    if path.exists():
+        manifest = pd.read_csv(path)
+        for col in key_cols:
+            if col not in manifest.columns:
+                manifest[col] = np.nan
+        mask = pd.Series([True] * len(manifest))
+        for col in key_cols:
+            mask &= manifest[col].astype(str) == str(row[col])
+        manifest = manifest.loc[~mask]
+        for col in new_row.columns:
+            if col not in manifest.columns:
+                manifest[col] = np.nan
+        for col in manifest.columns:
+            if col not in new_row.columns:
+                new_row[col] = np.nan
+        manifest = pd.concat([manifest, new_row[manifest.columns]], ignore_index=True)
+    else:
+        manifest = new_row
+    manifest.to_csv(path, index=False)
+
+
+def write_overall_metrics(summary_path: Path, dataset: str, model_name: str, label_protocol: str, method_name: str) -> None:
     if not summary_path.exists():
         return
     summary = pd.read_csv(summary_path)
@@ -2243,7 +3023,7 @@ def write_overall_metrics(summary_path: Path, dataset: str, model_name: str, lab
     ]
     rows = []
     lines = [
-        f"{dataset} {model_name} source-only overall metrics ({label_protocol})",
+        f"{dataset} {model_name} {method_name} overall metrics ({label_protocol})",
         "Primary aggregation: subject-wise mean +/- std across completed LOSO folds.",
         f"completed_folds={len(summary)}",
         "",
@@ -2262,7 +3042,7 @@ def write_overall_metrics(summary_path: Path, dataset: str, model_name: str, lab
         rows.append({"metric": metric_name, "mean": mean, "std": std, "n": int(len(valid))})
         lines.append(f"{metric_name}: mean={mean:.6f} std={std:.6f} n={len(valid)}")
 
-    stem = f"{dataset}_{model_name}_source_only_{label_protocol}_overall_metrics"
+    stem = f"{dataset}_{model_name}_{method_name}_{label_protocol}_overall_metrics"
     txt_path = summary_path.parent / f"{stem}.txt"
     csv_path = summary_path.parent / f"{stem}.csv"
     txt_path.write_text("\n".join(lines) + "\n")
@@ -2275,6 +3055,8 @@ def base_summary_fields(args: argparse.Namespace, plan: FoldPlan) -> dict[str, o
         "created_at": plan.created_at,
         "dataset": plan.dataset,
         "model": plan.model_name,
+        "method": args.method,
+        "adaptation_protocol": args.adaptation_protocol,
         "input_channels": plan.input_channels,
         "input_samples": plan.input_samples,
         "num_classes": plan.num_classes,
@@ -2335,6 +3117,7 @@ def upsert_summary_row(path: Path, row: dict[str, object]) -> None:
     key_cols = [
         "dataset",
         "model",
+        "method",
         "label_protocol",
         "label_mode",
         "target_subject",
@@ -2362,6 +3145,9 @@ def upsert_summary_row(path: Path, row: dict[str, object]) -> None:
         for col in new_row.columns:
             if col not in summary.columns:
                 summary[col] = row[col] if col in key_cols else np.nan
+        for col in key_cols:
+            if col not in summary.columns:
+                summary[col] = row.get(col, "")
         for col in summary.columns:
             if col not in new_row.columns:
                 new_row[col] = np.nan

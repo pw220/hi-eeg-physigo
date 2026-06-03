@@ -112,7 +112,7 @@ print(eegda.load_dataset("toy_eegda.npz").get_metadata())
 Current public model/method names:
 
 - models: `eegnet`
-- methods: `source_only`
+- methods: `source_only`, `adabn`
 
 Official adapters such as `seedvig` and `sadt-balanced` are provided for
 conversion and backward compatibility, but the recommended training input is a
@@ -169,6 +169,91 @@ python -m eegda.train \
 ```
 
 See `docs/standard_dataset_format.md`.
+
+### AdaBN
+
+AdaBN adapts a source-trained model by recomputing BatchNorm running statistics
+with unlabeled target EEG. It does not use target labels, does not compute a
+loss, does not run backpropagation, and does not update trainable model
+parameters. The default policy resets BatchNorm running statistics and performs
+one unlabeled target pass with cumulative BatchNorm momentum.
+
+```python
+import eegda
+
+results = eegda.run(
+    data="data/processed/seedvig/seedvig_8s_threshold35_min50_all_sessions.npz",
+    model="eegnet",
+    method="adabn",
+    protocol="loso",
+    run_all_loso=True,
+    adabn_reset_stats=True,
+    adabn_num_passes=1,
+)
+```
+
+CLI:
+
+```bash
+python -m eegda.train \
+  --data data/processed/seedvig/seedvig_8s_threshold35_min50_all_sessions.npz \
+  --model eegnet \
+  --method adabn \
+  --protocol loso \
+  --run-all-loso \
+  --adabn-reset-stats \
+  --adabn-num-passes 1
+```
+
+For formal SFDA benchmarking, train source checkpoints once and reuse them for
+every adaptation method. This guarantees that each method starts from the exact
+same fold-specific source model.
+
+Stage 1: train one source model per LOSO fold.
+
+```python
+source_run = eegda.run(
+    data="data/processed/seedvig/seedvig_8s_threshold35_min50_all_sessions.npz",
+    model="eegnet",
+    method="source_only",
+    protocol="loso",
+    run_all_loso=True,
+    epochs=50,
+    batch_size=64,
+    validation_mode="subject_split",
+    checkpoint_policy="best_val",
+    monitor_metric="macro_f1",
+    output_dir="outputs/source_only/SEED-VIG-P35-U/eegnet/seed42",
+    seed=42,
+)
+
+print(source_run.manifest_path)
+```
+
+Stage 2: adapt from the saved source manifest without retraining.
+
+```python
+adabn_run = eegda.run(
+    data="data/processed/seedvig/seedvig_8s_threshold35_min50_all_sessions.npz",
+    model="eegnet",
+    method="adabn",
+    protocol="loso",
+    run_all_loso=True,
+    reuse_source=True,
+    source_manifest=source_run.manifest_path,
+    output_dir="outputs/sfda/adabn/SEED-VIG-P35-U/eegnet/seed42",
+    seed=42,
+)
+```
+
+Each source fold saves `source_checkpoint.pt`, `split_info.json`,
+`normalization_stats.npz`, `class_weights.json`, `train_log.csv`, and a root
+`checkpoint_manifest.csv`. AdaBN reuse mode loads those files, applies
+source-training normalization to target data, recomputes BatchNorm statistics
+with unlabeled target samples, and writes `adaptation_manifest.csv`.
+
+For backward compatibility, `python -m droweeg.run` currently aliases the same
+entry point, but new code should use `eegda`.
 
 ## Current Working Pipeline
 
@@ -364,7 +449,7 @@ python train_eegnet_source.py --target-subject 1 --epochs 1 --batch-size 64 --de
 
 ## Running Standard Datasets And Models
 
-For now, `eegnet` is the only supported model and `source_only` is the only supported method. New EEGDA commands use `python -m eegda.train`.
+For now, `eegnet` is the supported model. Supported methods are `source_only` and `adabn`. New EEGDA commands use `python -m eegda.train`.
 
 SEED-VIG cached-file example:
 

@@ -33,6 +33,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--method", default="source_only")
     parser.add_argument("--protocol", choices=("loso",), default="loso")
     parser.add_argument("--adaptation-protocol", choices=("none", "transductive", "inductive_split"), default="none")
+    parser.add_argument("--reuse-source", action="store_true")
+    parser.add_argument("--source-manifest", default=None)
+    parser.add_argument("--source-checkpoint-dir", default=None)
+    parser.add_argument("--require-source-checkpoint", action="store_true", default=True)
+    parser.add_argument("--no-require-source-checkpoint", action="store_false", dest="require_source_checkpoint")
+    parser.add_argument("--save-adapted-checkpoint", action="store_true", default=True)
+    parser.add_argument("--no-save-adapted-checkpoint", action="store_false", dest="save_adapted_checkpoint")
+    parser.add_argument("--adabn-reset-stats", action="store_true", default=True)
+    parser.add_argument("--no-adabn-reset-stats", action="store_false", dest="adabn_reset_stats")
+    parser.add_argument("--adabn-momentum", type=float, default=None)
+    parser.add_argument("--adabn-num-passes", type=int, default=1)
     parser.add_argument("--target-subject", default=None)
     parser.add_argument("--target-subjects", default=None, help="Comma-separated fold subject indices, e.g. 1,2,3.")
     parser.add_argument("--target-id-space", "--target-subject-id-space", choices=("canonical", "raw"), default="canonical")
@@ -97,6 +108,7 @@ def main(argv: list[str] | None = None) -> EEGDAResults:
 def run_from_kwargs(**kwargs) -> EEGDAResults:
     if kwargs.get("data") is not None and kwargs.get("dataset") is not None:
         raise ValueError("Provide either data or dataset, not both.")
+    kwargs = _normalize_method_kwargs(kwargs)
     if kwargs.get("data") is not None:
         kwargs = dict(kwargs)
         kwargs.setdefault("dataset", "standard-npz")
@@ -116,6 +128,14 @@ def run_from_kwargs(**kwargs) -> EEGDAResults:
             kwargs["standard_npz_path"] = str(path)
             return main(kwargs_to_argv(kwargs))
     return main(kwargs_to_argv(kwargs))
+
+
+def _normalize_method_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(kwargs)
+    if normalized.get("adabn_reset_stats") is False:
+        normalized.pop("adabn_reset_stats")
+        normalized["no_adabn_reset_stats"] = True
+    return normalized
 
 
 def to_backend_argv(args: argparse.Namespace) -> list[str]:
@@ -153,7 +173,9 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
         "--method",
         args.method,
         "--adaptation-protocol",
-        args.adaptation_protocol,
+        effective_adaptation_protocol(args),
+        "--require-source-checkpoint" if args.require_source_checkpoint else "--no-require-source-checkpoint",
+        "--save-adapted-checkpoint" if args.save_adapted_checkpoint else "--no-save-adapted-checkpoint",
         "--seed",
         str(args.seed),
         "--num-workers",
@@ -193,6 +215,20 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
         "--eegnet-norm-rate",
         str(args.eegnet_norm_rate),
     ]
+    if args.reuse_source:
+        argv.append("--reuse-source")
+    if args.source_manifest is not None:
+        argv.extend(["--source-manifest", str(args.source_manifest)])
+    if args.source_checkpoint_dir is not None:
+        argv.extend(["--source-checkpoint-dir", str(args.source_checkpoint_dir)])
+    if args.method == "adabn":
+        if args.adabn_reset_stats:
+            argv.append("--adabn-reset-stats")
+        else:
+            argv.append("--no-adabn-reset-stats")
+        if args.adabn_momentum is not None:
+            argv.extend(["--adabn-momentum", str(args.adabn_momentum)])
+        argv.extend(["--adabn-num-passes", str(args.adabn_num_passes)])
     if dataset_name == "seedvig":
         argv.extend(["--label-mode", args.label_mode or "threshold35"])
         if args.raw_data_dir is not None:
@@ -254,7 +290,10 @@ def build_result(args: argparse.Namespace, backend_argv: list[str]) -> EEGDAResu
         "model": args.model,
         "method": args.method,
         "protocol": args.protocol,
-        "adaptation_protocol": args.adaptation_protocol,
+        "adaptation_protocol": effective_adaptation_protocol(args),
+        "reuse_source": args.reuse_source,
+        "source_manifest": args.source_manifest,
+        "source_checkpoint_dir": args.source_checkpoint_dir,
         "label_protocol": label_protocol,
         "target_subject": args.target_subject,
         "target_subjects": None if args.target_subjects is None else parse_target_subjects_value(args.target_subjects),
@@ -276,6 +315,8 @@ def build_result(args: argparse.Namespace, backend_argv: list[str]) -> EEGDAResu
         "reports_dir": root / "reports",
         "summary_path": root / "summaries" / f"{stem}_summary.csv",
         "manifest_path": root / "checkpoints" / "checkpoints_manifest.csv",
+        "source_manifest_path": root / "checkpoint_manifest.csv",
+        "adaptation_manifest_path": root / "adaptation_manifest.csv",
     }
     result.update({key: str(path) for key, path in paths.items()})
     summary_path = paths["summary_path"]
@@ -311,10 +352,18 @@ def validate_target_selection(args: argparse.Namespace) -> None:
 
     register_builtin_components()
     get_method(args.method)
-    if args.method != "source_only":
-        raise ValueError("Only method='source_only' is implemented in Phase 0; no SFDA methods are available yet.")
-    if args.adaptation_protocol != "none":
-        raise ValueError("Only adaptation_protocol='none' is implemented in Phase 0.")
+    if args.method not in {"source_only", "adabn"}:
+        raise ValueError("Only method='source_only' and method='adabn' are implemented; no other SFDA methods are available yet.")
+    if args.method == "source_only" and args.adaptation_protocol != "none":
+        raise ValueError("source_only requires adaptation_protocol='none'.")
+    if args.method == "source_only" and args.reuse_source:
+        raise ValueError("reuse_source is only valid for adaptation methods such as method='adabn', not source_only.")
+    if args.method == "adabn" and args.adaptation_protocol not in {"none", "transductive"}:
+        raise ValueError("AdaBN supports adaptation_protocol='transductive' only; omit the argument to use the default.")
+    if args.reuse_source and args.method != "source_only" and args.source_manifest is None and args.source_checkpoint_dir is None:
+        raise ValueError("reuse_source=True requires source_manifest or source_checkpoint_dir.")
+    if args.adabn_num_passes <= 0:
+        raise ValueError("adabn_num_passes must be positive.")
     if args.run_all_loso and (args.target_subjects is not None or args.target_subject is not None):
         raise ValueError(
             "run_all_loso=True cannot be used with target_subject or target_subjects. "
@@ -326,6 +375,12 @@ def effective_run_all_loso(args: argparse.Namespace) -> bool:
     if args.run_all_loso is not None:
         return bool(args.run_all_loso)
     return args.target_subject is None and args.target_subjects is None
+
+
+def effective_adaptation_protocol(args: argparse.Namespace) -> str:
+    if args.method == "adabn" and args.adaptation_protocol == "none":
+        return "transductive"
+    return args.adaptation_protocol
 
 
 def target_subjects_to_cli(value: object) -> str:

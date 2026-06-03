@@ -11,6 +11,9 @@ class EEGDAResults:
     def __init__(self, metadata: dict[str, Any]) -> None:
         self.metadata = metadata
         self.output_dir = metadata.get("output_dir")
+        self.manifest_path = metadata.get("source_manifest_path") or metadata.get("manifest_path")
+        self.source_manifest_path = metadata.get("source_manifest_path")
+        self.adaptation_manifest_path = metadata.get("adaptation_manifest_path")
         self.artifacts = self._load_artifacts()
         self.fold_metrics = self._load_fold_metrics()
         self.aggregate_metrics = self._load_aggregate_metrics()
