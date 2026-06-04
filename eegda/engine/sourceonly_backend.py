@@ -673,7 +673,7 @@ def plan_loso_fold(
     target_subject: int,
     outputs_dir: Path,
 ) -> FoldPlan:
-    if context.dataset == "seedvig":
+    if args.dataset == "seedvig":
         train_pairs, val_pairs, test_pairs, train_counts, val_counts, test_counts, train_subject_ids, val_subject_ids = (
             plan_seedvig_splits(args, context, target_subject)
         )
@@ -1429,7 +1429,7 @@ def run_reuse_source_fold(
 def write_fold_report(args: argparse.Namespace, context: DatasetContext, plan: FoldPlan) -> None:
     if not plan.outputs_enabled:
         return
-    if context.dataset == "seedvig":
+    if args.dataset == "seedvig":
         if context.integrity_report is None:
             raise ValueError("SEED-VIG fold report requires an integrity report")
         write_loso_fold_integrity_report(
@@ -1487,7 +1487,7 @@ def write_fold_report(args: argparse.Namespace, context: DatasetContext, plan: F
 
 
 def print_dataset_fold_summary(args: argparse.Namespace, context: DatasetContext, plan: FoldPlan) -> None:
-    if context.dataset == "seedvig" and context.integrity_report is not None:
+    if args.dataset == "seedvig" and context.integrity_report is not None:
         print_integrity_report_summary(
             context.integrity_report,
             target_subject=plan.target_subject,
@@ -1505,7 +1505,7 @@ def print_dataset_fold_summary(args: argparse.Namespace, context: DatasetContext
     print(f"  input_samples={context.input_samples}")
     print(f"  num_classes={context.num_classes}")
     print(f"  label_protocol={context.label_protocol}")
-    if context.dataset != "seedvig":
+    if args.dataset != "seedvig":
         print(f"  label_mode={args.label_mode} label_mode_applicable=False")
     print(f"  normalization_stats=source_training_only")
 
@@ -1515,7 +1515,7 @@ def load_fold_arrays(
     context: DatasetContext,
     plan: FoldPlan,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray] | None, dict[str, np.ndarray], list, list, list]:
-    if context.dataset == "seedvig":
+    if args.dataset == "seedvig":
         train_sessions = load_seedvig_file_pairs(plan.train_pairs, label_mode=args.label_mode, bandpass=args.bandpass)
         if args.validation_mode == "subject_split":
             val_sessions = load_seedvig_file_pairs(plan.val_pairs, label_mode=args.label_mode, bandpass=args.bandpass)
@@ -1557,7 +1557,7 @@ def load_target_arrays(
     context: DatasetContext,
     plan: FoldPlan,
 ) -> tuple[dict[str, np.ndarray], list]:
-    if context.dataset == "seedvig":
+    if args.dataset == "seedvig":
         test_sessions = load_seedvig_file_pairs(plan.test_pairs, label_mode=args.label_mode, bandpass=args.bandpass)
         return sessions_to_arrays(test_sessions), test_sessions
     if context.sadt_arrays is None:
@@ -1875,7 +1875,7 @@ def write_run_reports(
             "label_config": {
                 "label_mode": args.label_mode,
                 "label_mode_explicit": bool(getattr(args, "label_mode_explicit", False)),
-                "label_mode_applicable": context.dataset == "seedvig",
+                "label_mode_applicable": args.dataset == "seedvig",
                 "label_protocol": context.label_protocol,
             },
         },
@@ -1943,7 +1943,7 @@ def print_run_overview(
             print("[OK] Source training is skipped; fold source checkpoints are loaded from the source manifest.")
     if args.validation_mode == "none":
         print(f"[WARN] No validation set is used; checkpoint_policy={args.checkpoint_policy} will be used.")
-    if context.dataset != "seedvig" and getattr(args, "label_mode_explicit", False):
+    if args.dataset != "seedvig" and getattr(args, "label_mode_explicit", False):
         print(f"[WARN] label_mode={args.label_mode} was provided but is not applicable to this label protocol.")
     if not args.run_all_loso and len(target_subjects) < len(context.subjects):
         print(f"[WARN] Partial LOSO run: {len(target_subjects)} / {len(context.subjects)} subjects selected.")
@@ -3199,7 +3199,7 @@ def print_global_plan_header(args: argparse.Namespace, context: DatasetContext, 
     print(f"  num_classes={context.num_classes}")
     print(f"  label_protocol={context.label_protocol}")
     print(f"  label_mode={args.label_mode}")
-    if context.dataset != "seedvig":
+    if args.dataset != "seedvig":
         print("  label_mode_applicable=False")
     print(f"  class_balance={args.class_balance}")
     print(f"  loss_type={args.loss_type}")
@@ -3337,7 +3337,7 @@ def print_discovery_sanity(file_pairs, subjects: list[int]) -> None:
 
 
 def print_source_sanity(train_sessions, val_sessions, context: DatasetContext) -> None:
-    if context.dataset != "seedvig":
+    if context.integrity_report is None:
         print(f"final_segment_shape_per_sample=({context.input_channels}, {context.input_samples})")
         print("source_raw_nan_count=0 source_raw_inf_count=0")
         return
@@ -3375,7 +3375,7 @@ def print_source_split_sanity(train, val) -> None:
 
 
 def print_target_sanity(test_sessions, test, context: DatasetContext) -> None:
-    if context.dataset != "seedvig":
+    if context.integrity_report is None:
         values, counts = np.unique(test["y"], return_counts=True)
         distribution = dict(zip(values.tolist(), counts.tolist(), strict=False))
         print(f"target_count={len(test['y'])}")
