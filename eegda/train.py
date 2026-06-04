@@ -36,6 +36,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reuse-source", action="store_true")
     parser.add_argument("--source-manifest", default=None)
     parser.add_argument("--source-checkpoint-dir", default=None)
+    parser.add_argument("--source-run-id", default=None)
     parser.add_argument("--require-source-checkpoint", action="store_true", default=True)
     parser.add_argument("--no-require-source-checkpoint", action="store_false", dest="require_source_checkpoint")
     parser.add_argument("--save-adapted-checkpoint", action="store_true", default=True)
@@ -82,6 +83,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="macro_f1",
     )
     parser.add_argument("--output-dir", default="outputs")
+    parser.add_argument(
+        "--group-output",
+        action="store_true",
+        help="Append dataset_model_method_protocol under --output-dir. By default --output-dir is used directly.",
+    )
     parser.add_argument("--epoch-log-interval", type=int, default=10)
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -147,7 +153,7 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
     else:
         label_protocol = label_protocol_for_args(args)
     dataset_key = dataset_key_for_args(args)
-    output_dir = _resolve_output_dir(args.output_dir, dataset_key, args.model, args.method, label_protocol)
+    output_dir = _resolve_output_dir(args.output_dir, dataset_key, args.model, args.method, label_protocol, group_output=args.group_output)
     backend_dataset = {"seedvig": "seedvig", "sadt-balanced": "sadt", "standard-npz": "standard-npz"}[dataset_name]
     argv = [
         "--dataset",
@@ -221,6 +227,8 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
         argv.extend(["--source-manifest", str(args.source_manifest)])
     if args.source_checkpoint_dir is not None:
         argv.extend(["--source-checkpoint-dir", str(args.source_checkpoint_dir)])
+    if args.source_run_id is not None:
+        argv.extend(["--source-run-id", str(args.source_run_id)])
     if args.method == "adabn":
         if args.adabn_reset_stats:
             argv.append("--adabn-reset-stats")
@@ -279,7 +287,7 @@ def build_result(args: argparse.Namespace, backend_argv: list[str]) -> EEGDAResu
     label_protocol = label_protocol_for_args(args)
     dataset_name = effective_dataset(args)
     dataset_key = dataset_key_for_args(args)
-    output_dir = _resolve_output_dir(args.output_dir, dataset_key, args.model, args.method, label_protocol)
+    output_dir = _resolve_output_dir(args.output_dir, dataset_key, args.model, args.method, label_protocol, group_output=args.group_output)
     outputs_enabled = output_dir.strip().lower() not in {"none", "null", "off", "false"}
     result: dict[str, Any] = {
         "status": "completed",
@@ -294,6 +302,7 @@ def build_result(args: argparse.Namespace, backend_argv: list[str]) -> EEGDAResu
         "reuse_source": args.reuse_source,
         "source_manifest": args.source_manifest,
         "source_checkpoint_dir": args.source_checkpoint_dir,
+        "source_run_id": args.source_run_id,
         "label_protocol": label_protocol,
         "target_subject": args.target_subject,
         "target_subjects": None if args.target_subjects is None else parse_target_subjects_value(args.target_subjects),
@@ -425,10 +434,12 @@ def _safe_name(value: str) -> str:
     return cleaned.strip("_") or "dataset"
 
 
-def _resolve_output_dir(output_dir: str, dataset: str, model: str, method: str, label_protocol: str) -> str:
+def _resolve_output_dir(output_dir: str, dataset: str, model: str, method: str, label_protocol: str, *, group_output: bool) -> str:
     if output_dir.strip().lower() in {"none", "null", "off", "false"}:
         return "none"
-    return str(Path(output_dir) / f"{dataset}_{model}_{method}_{label_protocol}")
+    if group_output:
+        return str(Path(output_dir) / f"{dataset}_{model}_{method}_{label_protocol}")
+    return str(Path(output_dir))
 
 
 if __name__ == "__main__":

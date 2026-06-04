@@ -209,6 +209,10 @@ For formal SFDA benchmarking, train source checkpoints once and reuse them for
 every adaptation method. This guarantees that each method starts from the exact
 same fold-specific source model.
 
+`output_dir` is used as the run directory exactly as provided. EEGDA does not
+append another long dataset/model/method folder unless `group_output=True` is
+explicitly requested.
+
 Stage 1: train one source model per LOSO fold.
 
 ```python

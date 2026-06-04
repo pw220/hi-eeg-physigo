@@ -136,6 +136,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reuse-source", action="store_true")
     parser.add_argument("--source-manifest", default=None)
     parser.add_argument("--source-checkpoint-dir", default=None)
+    parser.add_argument("--source-run-id", default=None)
     parser.add_argument("--require-source-checkpoint", action="store_true", default=True)
     parser.add_argument("--no-require-source-checkpoint", action="store_false", dest="require_source_checkpoint")
     parser.add_argument("--save-adapted-checkpoint", action="store_true", default=True)
@@ -1604,6 +1605,10 @@ def find_source_checkpoint_row(
         mask &= pd.to_numeric(manifest["seed"], errors="coerce") == int(args.seed)
     if "target_subject" in manifest.columns:
         mask &= pd.to_numeric(manifest["target_subject"], errors="coerce") == int(plan.target_subject)
+    if args.source_run_id is not None:
+        if "run_id" not in manifest.columns:
+            raise ValueError("--source-run-id was provided, but the source manifest has no run_id column")
+        mask &= manifest["run_id"].astype(str) == str(args.source_run_id)
     protocol_cols = [col for col in ("protocol_name", "label_protocol") if col in manifest.columns]
     if protocol_cols:
         protocol_mask = pd.Series([False] * len(manifest))
@@ -1614,11 +1619,18 @@ def find_source_checkpoint_row(
     if rows.empty:
         return None
     if len(rows) > 1:
-        raise ValueError(
-            f"Multiple source checkpoints match target_subject={plan.target_subject} in {manifest_path}. "
-            "Use a manifest with unique rows for this benchmark run."
+        rows = sort_manifest_rows_latest_first(rows)
+        selected = rows.iloc[0]
+        console(
+            args,
+            "[WARN] Multiple source checkpoints matched "
+            f"target_subject={plan.target_subject}; using latest run_id={selected.get('run_id', '')}. "
+            "Pass source_run_id=... to select an exact checkpoint.",
+            "normal",
         )
-    row = rows.iloc[0]
+        row = selected
+    else:
+        row = rows.iloc[0]
     required = ["checkpoint_path", "normalization_stats_path", "split_info_path", "class_weights_path"]
     missing = [col for col in required if col not in row.index or pd.isna(row[col]) or str(row[col]) == ""]
     if missing:
@@ -1627,6 +1639,18 @@ def find_source_checkpoint_row(
         if not Path(str(row[col])).exists():
             raise FileNotFoundError(f"Manifest column {col} points to a missing file: {row[col]}")
     return row
+
+
+def sort_manifest_rows_latest_first(rows: pd.DataFrame) -> pd.DataFrame:
+    rows = rows.copy()
+    if "created_at" in rows.columns:
+        parsed = pd.to_datetime(rows["created_at"], errors="coerce", utc=True)
+        rows["_sort_created_at"] = parsed
+        rows.sort_values(["_sort_created_at"], ascending=False, inplace=True, na_position="last")
+        return rows.drop(columns=["_sort_created_at"])
+    if "run_id" in rows.columns:
+        rows.sort_values("run_id", ascending=False, inplace=True)
+    return rows
 
 
 def load_class_weights_for_reuse(path: str | Path) -> np.ndarray | None:
@@ -1832,6 +1856,7 @@ def write_run_reports(
             "reuse_source": args.reuse_source,
             "source_manifest": args.source_manifest,
             "source_checkpoint_dir": args.source_checkpoint_dir,
+            "source_run_id": args.source_run_id,
             "require_source_checkpoint": args.require_source_checkpoint,
             "save_adapted_checkpoint": args.save_adapted_checkpoint,
             "adabn": {
@@ -1868,6 +1893,7 @@ def write_run_reports(
             "reuse_source": args.reuse_source,
             "source_manifest": args.source_manifest,
             "source_checkpoint_dir": args.source_checkpoint_dir,
+            "source_run_id": args.source_run_id,
             "early_stop_enabled": early_stop_enabled(args),
             "monitor_metric": args.monitor_metric,
             "target_labels_for_model_selection": False,
@@ -2941,7 +2967,11 @@ def write_source_checkpoint_manifest_row(
         "test_subject_raw_ids": json.dumps(jsonable(plan.test_subject_raw_ids)),
         "created_at": plan.created_at,
     }
-    upsert_manifest_row(path, row, key_cols=["run_id"])
+    upsert_manifest_row(
+        path,
+        row,
+        key_cols=["dataset_path", "protocol_name", "model_name", "seed", "target_subject", "target_id_space"],
+    )
 
 
 def write_adaptation_manifest_row(
