@@ -294,7 +294,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.dry_run:
         for idx, plan in enumerate(plans, start=1):
             if should_log(args, "verbose"):
-                print_fold_plan(plan, dry_run=True)
+                print_fold_plan(plan, dry_run=True, include_artifacts=should_log(args, "debug"))
             elif should_log(args, "normal"):
                 print_compact_fold_start(plan, idx, len(plans), dry_run=True)
         if should_log(args, "debug"):
@@ -828,9 +828,9 @@ def run_loso_fold(
     write_fold_report(args, context, plan)
     if should_log(args, "debug"):
         print_dataset_fold_summary(args, context, plan)
-        print_fold_plan(plan, dry_run=False)
+        print_fold_plan(plan, dry_run=False, include_artifacts=True)
     elif should_log(args, "verbose"):
-        print_fold_plan(plan, dry_run=False)
+        print_fold_plan(plan, dry_run=False, include_artifacts=False)
     elif should_log(args, "normal"):
         print_compact_fold_start(plan, fold_index, fold_total, dry_run=False)
 
@@ -894,10 +894,8 @@ def run_loso_fold(
     if args.test_every_epochs > 0:
         console(
             args,
-            "target_interval_evaluation=diagnostic_only "
-            "target labels are not used for training, checkpoint selection, early stopping, or model selection; "
-            f"final checkpoint still follows checkpoint_policy={args.checkpoint_policy}",
-            "verbose",
+            "Target diagnostics enabled: audit only; target metrics are not used for checkpoint selection.",
+            "normal",
         )
 
     class_weights = engine_trainer.compute_class_weights(train["y"], args.class_balance)
@@ -966,7 +964,7 @@ def run_loso_fold(
                 best_target_diagnostic_auc = epoch_target_auc
                 best_target_diagnostic_epoch = epoch
                 best_target_diagnostic_metrics = epoch_metrics
-            if should_log(args, "verbose"):
+            if should_log(args, "normal"):
                 print_epoch_test_metrics(plan.target_subject, epoch, epoch_metrics)
         if early_stop_enabled(args) and checkpoint_tracker.epochs_without_improvement >= args.early_stop_patience:
             console(
@@ -3273,7 +3271,7 @@ def print_model_selection_policy(args: argparse.Namespace) -> None:
         print("  target_labels_for_model_selection=False")
 
 
-def print_fold_plan(plan: FoldPlan, *, dry_run: bool) -> None:
+def print_fold_plan(plan: FoldPlan, *, dry_run: bool, include_artifacts: bool) -> None:
     prefix = "dry_run_fold_plan" if dry_run else "fold_plan"
     print(prefix)
     print(f"  dataset={plan.dataset}")
@@ -3298,28 +3296,31 @@ def print_fold_plan(plan: FoldPlan, *, dry_run: bool) -> None:
             f"  {name}: sessions={counts['sessions']} usable={counts['usable']} "
             f"alert={counts['alert']} fatigue={counts['fatigue']} excluded={counts['excluded']}"
         )
-    if plan.outputs_enabled:
-        print(f"  predictions={plan.prediction_path}")
-        print(f"  checkpoint={plan.checkpoint_path}")
-    else:
-        print("  predictions=disabled")
-        print("  checkpoint=disabled")
-    if plan.latest_checkpoint_path is not None and plan.outputs_enabled:
-        print(f"  latest_checkpoint={plan.latest_checkpoint_path}")
-    if plan.outputs_enabled:
-        print(f"  summary={plan.summary_path}")
-        print(f"  fold_report={plan.fold_report_path}")
-        print(f"  val_metrics={plan.val_metrics_path}")
-        print(f"  test_metrics_history={plan.test_metrics_path}")
-        print(f"  manifest={plan.manifest_path}")
-    else:
-        print("  summary=disabled")
-        print("  fold_report=disabled")
-        print("  val_metrics=disabled")
-        print("  test_metrics_history=disabled")
-        print("  manifest=disabled")
     print(f"  run_id={plan.run_id}")
-    print(f"  single_fold_command={plan.single_fold_command}")
+    if include_artifacts:
+        if plan.outputs_enabled:
+            print(f"  predictions={plan.prediction_path}")
+            print(f"  checkpoint={plan.checkpoint_path}")
+        else:
+            print("  predictions=disabled")
+            print("  checkpoint=disabled")
+        if plan.latest_checkpoint_path is not None and plan.outputs_enabled:
+            print(f"  latest_checkpoint={plan.latest_checkpoint_path}")
+        if plan.outputs_enabled:
+            print(f"  summary={plan.summary_path}")
+            print(f"  fold_report={plan.fold_report_path}")
+            print(f"  val_metrics={plan.val_metrics_path}")
+            print(f"  test_metrics_history={plan.test_metrics_path}")
+            print(f"  manifest={plan.manifest_path}")
+        else:
+            print("  summary=disabled")
+            print("  fold_report=disabled")
+            print("  val_metrics=disabled")
+            print("  test_metrics_history=disabled")
+            print("  manifest=disabled")
+        print(f"  single_fold_command={plan.single_fold_command}")
+    elif plan.outputs_enabled:
+        print(f"  artifacts_root={run_dir(plan)}")
     if dry_run:
         print("  target_counts_are_audit_only=True")
         print("  loads_full_eeg_tensors=False")
@@ -3448,15 +3449,12 @@ def print_best_target_diagnostic_metrics(epoch: int, metrics: dict[str, object])
 
 def print_epoch_test_metrics(target_subject: int, epoch: int, metrics: dict[str, object]) -> None:
     print(
-        f"target_diagnostic_metrics target_subject={target_subject} epoch={epoch:03d} "
-        f"accuracy={format_metric(metrics['accuracy'])} "
-        f"balanced_accuracy={format_metric(metrics['balanced_accuracy'])} "
-        f"macro_f1={format_metric(metrics['macro_f1'])} "
-        f"roc_auc={format_metric(metrics['roc_auc'])} "
-        f"auprc={format_metric(metrics['auprc'])} "
-        f"sensitivity={format_metric(metrics['sensitivity'])} "
-        f"specificity={format_metric(metrics['specificity'])} "
-        f"miss_rate={format_metric(metrics['miss_rate'])}"
+        f"Target diagnostic | epoch={epoch:03d} | "
+        f"bal_acc={format_metric(metrics['balanced_accuracy'])} | "
+        f"macro_f1={format_metric(metrics['macro_f1'])} | "
+        f"auc={format_metric(metrics['roc_auc'])} | "
+        f"fatigue_recall={format_metric(metrics['sensitivity'])} | "
+        f"specificity={format_metric(metrics['specificity'])}"
     )
 
 
