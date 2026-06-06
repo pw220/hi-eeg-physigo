@@ -250,11 +250,32 @@ adabn_run = eegda.run(
 )
 ```
 
+SHOT-IM can reuse the same source manifest. The implementation uses unlabeled
+target data only, freezes the classifier by default, and adapts the feature
+extractor with the information maximization objective.
+
+```python
+shot_run = eegda.run(
+    data="data/processed/seedvig/seedvig_8s_threshold35_min50_all_sessions.npz",
+    model="eegnet",
+    method="shot_im",
+    protocol="loso",
+    run_all_loso=True,
+    reuse_source=True,
+    source_manifest=source_run.manifest_path,
+    shot_epochs=20,
+    shot_lr=1e-4,
+    shot_freeze_classifier=True,
+    output_dir="outputs/sfda/shot_im/SEED-VIG-P35-U/eegnet/seed42",
+    seed=42,
+)
+```
+
 Each source fold saves `source_checkpoint.pt`, `split_info.json`,
 `normalization_stats.npz`, `class_weights.json`, `train_log.csv`, and a root
-`checkpoint_manifest.csv`. AdaBN reuse mode loads those files, applies
-source-training normalization to target data, recomputes BatchNorm statistics
-with unlabeled target samples, and writes `adaptation_manifest.csv`.
+`checkpoint_manifest.csv`. SFDA reuse mode loads those files, applies
+source-training normalization to target data, adapts with unlabeled target
+samples, and writes `adaptation_manifest.csv`.
 
 For backward compatibility, `python -m droweeg.run` currently aliases the same
 entry point, but new code should use `eegda`.
@@ -453,7 +474,8 @@ python train_eegnet_source.py --target-subject 1 --epochs 1 --batch-size 64 --de
 
 ## Running Standard Datasets And Models
 
-For now, `eegnet` is the supported model. Supported methods are `source_only` and `adabn`. New EEGDA commands use `python -m eegda.train`.
+For now, `eegnet` is the supported model. Supported methods are `source_only`,
+`adabn`, and `shot_im`. New EEGDA commands use `python -m eegda.train`.
 
 SEED-VIG cached-file example:
 

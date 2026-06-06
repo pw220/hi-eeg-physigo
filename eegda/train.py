@@ -45,6 +45,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-adabn-reset-stats", action="store_false", dest="adabn_reset_stats")
     parser.add_argument("--adabn-momentum", type=float, default=None)
     parser.add_argument("--adabn-num-passes", type=int, default=1)
+    parser.add_argument("--shot-epochs", type=int, default=20)
+    parser.add_argument("--shot-lr", type=float, default=1e-4)
+    parser.add_argument("--shot-weight-decay", type=float, default=0.0)
+    parser.add_argument("--shot-entropy-weight", type=float, default=1.0)
+    parser.add_argument("--shot-diversity-weight", type=float, default=1.0)
+    parser.add_argument("--shot-freeze-classifier", action="store_true", default=True)
+    parser.add_argument("--no-shot-freeze-classifier", action="store_false", dest="shot_freeze_classifier")
+    parser.add_argument("--shot-grad-clip-norm", type=float, default=0.0)
+    parser.add_argument("--shot-log-interval", type=int, default=10)
     parser.add_argument("--target-subject", default=None)
     parser.add_argument("--target-subjects", default=None, help="Comma-separated fold subject indices, e.g. 1,2,3.")
     parser.add_argument("--target-id-space", "--target-subject-id-space", choices=("canonical", "raw"), default="canonical")
@@ -141,6 +150,9 @@ def _normalize_method_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     if normalized.get("adabn_reset_stats") is False:
         normalized.pop("adabn_reset_stats")
         normalized["no_adabn_reset_stats"] = True
+    if normalized.get("shot_freeze_classifier") is False:
+        normalized.pop("shot_freeze_classifier")
+        normalized["no_shot_freeze_classifier"] = True
     return normalized
 
 
@@ -237,6 +249,15 @@ def to_backend_argv(args: argparse.Namespace) -> list[str]:
         if args.adabn_momentum is not None:
             argv.extend(["--adabn-momentum", str(args.adabn_momentum)])
         argv.extend(["--adabn-num-passes", str(args.adabn_num_passes)])
+    if args.method == "shot_im":
+        argv.extend(["--shot-epochs", str(args.shot_epochs)])
+        argv.extend(["--shot-lr", str(args.shot_lr)])
+        argv.extend(["--shot-weight-decay", str(args.shot_weight_decay)])
+        argv.extend(["--shot-entropy-weight", str(args.shot_entropy_weight)])
+        argv.extend(["--shot-diversity-weight", str(args.shot_diversity_weight)])
+        argv.append("--shot-freeze-classifier" if args.shot_freeze_classifier else "--no-shot-freeze-classifier")
+        argv.extend(["--shot-grad-clip-norm", str(args.shot_grad_clip_norm)])
+        argv.extend(["--shot-log-interval", str(args.shot_log_interval)])
     if dataset_name == "seedvig":
         argv.extend(["--label-mode", args.label_mode or "threshold35"])
         if args.raw_data_dir is not None:
@@ -361,18 +382,33 @@ def validate_target_selection(args: argparse.Namespace) -> None:
 
     register_builtin_components()
     get_method(args.method)
-    if args.method not in {"source_only", "adabn"}:
-        raise ValueError("Only method='source_only' and method='adabn' are implemented; no other SFDA methods are available yet.")
+    if args.method not in {"source_only", "adabn", "shot_im"}:
+        raise ValueError(
+            "Only method='source_only', method='adabn', and method='shot_im' are implemented; "
+            "no other SFDA methods are available yet."
+        )
     if args.method == "source_only" and args.adaptation_protocol != "none":
         raise ValueError("source_only requires adaptation_protocol='none'.")
     if args.method == "source_only" and args.reuse_source:
         raise ValueError("reuse_source is only valid for adaptation methods such as method='adabn', not source_only.")
-    if args.method == "adabn" and args.adaptation_protocol not in {"none", "transductive"}:
-        raise ValueError("AdaBN supports adaptation_protocol='transductive' only; omit the argument to use the default.")
+    if args.method in {"adabn", "shot_im"} and args.adaptation_protocol not in {"none", "transductive"}:
+        raise ValueError(f"{args.method} supports adaptation_protocol='transductive' only; omit the argument to use the default.")
     if args.reuse_source and args.method != "source_only" and args.source_manifest is None and args.source_checkpoint_dir is None:
         raise ValueError("reuse_source=True requires source_manifest or source_checkpoint_dir.")
     if args.adabn_num_passes <= 0:
         raise ValueError("adabn_num_passes must be positive.")
+    if args.shot_epochs <= 0:
+        raise ValueError("shot_epochs must be positive.")
+    if args.shot_lr <= 0:
+        raise ValueError("shot_lr must be positive.")
+    if args.shot_weight_decay < 0:
+        raise ValueError("shot_weight_decay must be non-negative.")
+    if args.shot_entropy_weight < 0 or args.shot_diversity_weight < 0:
+        raise ValueError("SHOT-IM loss weights must be non-negative.")
+    if args.shot_grad_clip_norm < 0:
+        raise ValueError("shot_grad_clip_norm must be non-negative.")
+    if args.shot_log_interval <= 0:
+        raise ValueError("shot_log_interval must be positive.")
     if args.run_all_loso and (args.target_subjects is not None or args.target_subject is not None):
         raise ValueError(
             "run_all_loso=True cannot be used with target_subject or target_subjects. "
@@ -387,7 +423,7 @@ def effective_run_all_loso(args: argparse.Namespace) -> bool:
 
 
 def effective_adaptation_protocol(args: argparse.Namespace) -> str:
-    if args.method == "adabn" and args.adaptation_protocol == "none":
+    if args.method in {"adabn", "shot_im"} and args.adaptation_protocol == "none":
         return "transductive"
     return args.adaptation_protocol
 

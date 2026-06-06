@@ -53,6 +53,7 @@ def register_builtin_components() -> None:
     from eegda.datasets.seedvig import SeedVIGDataset
     from eegda.datasets.standard_npz import StandardDataset
     from eegda.methods.adabn import AdaBNMethod
+    from eegda.methods.shot_im import ShotIMMethod
     from eegda.methods.source_only import SourceOnlyMethod
     from models.eegnet import EEGNet
 
@@ -61,6 +62,7 @@ def register_builtin_components() -> None:
     register_dataset("standard-npz", StandardDataset)
     register_model("eegnet", EEGNet)
     register_method("adabn", AdaBNMethod)
+    register_method("shot_im", ShotIMMethod)
     register_method("source_only", SourceOnlyMethod)
     _BUILTINS_REGISTERED = True
 

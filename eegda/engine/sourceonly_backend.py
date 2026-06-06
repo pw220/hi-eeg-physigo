@@ -49,6 +49,7 @@ from utils.seed import set_seed
 
 
 LOG_LEVELS = {"quiet": 0, "normal": 1, "verbose": 2, "debug": 3}
+ADAPTATION_METHODS = {"adabn", "shot_im"}
 CORE_METRIC_KEYS = [
     "accuracy",
     "balanced_accuracy",
@@ -145,6 +146,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-adabn-reset-stats", action="store_false", dest="adabn_reset_stats")
     parser.add_argument("--adabn-momentum", type=float, default=None)
     parser.add_argument("--adabn-num-passes", type=int, default=1)
+    parser.add_argument("--shot-epochs", type=int, default=20)
+    parser.add_argument("--shot-lr", type=float, default=1e-4)
+    parser.add_argument("--shot-weight-decay", type=float, default=0.0)
+    parser.add_argument("--shot-entropy-weight", type=float, default=1.0)
+    parser.add_argument("--shot-diversity-weight", type=float, default=1.0)
+    parser.add_argument("--shot-freeze-classifier", action="store_true", default=True)
+    parser.add_argument("--no-shot-freeze-classifier", action="store_false", dest="shot_freeze_classifier")
+    parser.add_argument("--shot-grad-clip-norm", type=float, default=0.0)
+    parser.add_argument("--shot-log-interval", type=int, default=10)
     parser.add_argument("--data-root", default="data/raw/SEED-VIG")
     parser.add_argument("--raw-data-dir", default=None)
     parser.add_argument("--label-dir", default=None)
@@ -240,6 +250,17 @@ def make_method(args: argparse.Namespace):
             momentum=args.adabn_momentum,
             num_passes=args.adabn_num_passes,
         )
+    if args.method == "shot_im":
+        return method_cls(
+            epochs=args.shot_epochs,
+            lr=args.shot_lr,
+            weight_decay=args.shot_weight_decay,
+            entropy_weight=args.shot_entropy_weight,
+            diversity_weight=args.shot_diversity_weight,
+            freeze_classifier=args.shot_freeze_classifier,
+            grad_clip_norm=args.shot_grad_clip_norm,
+            log_interval=args.shot_log_interval,
+        )
     return method_cls()
 
 
@@ -250,7 +271,7 @@ def _argument_was_provided(argv: list[str], name: str) -> bool:
 def resolve_protocol_defaults(args: argparse.Namespace) -> None:
     if args.dataset == "seedvig" and args.label_mode is None:
         args.label_mode = "threshold35"
-    if args.method == "adabn" and args.adaptation_protocol == "none":
+    if args.method in ADAPTATION_METHODS and args.adaptation_protocol == "none":
         args.adaptation_protocol = "transductive"
     if args.checkpoint_policy is None:
         args.checkpoint_policy = "last" if args.validation_mode == "none" else "best_val"
@@ -521,18 +542,33 @@ def build_dataset_context(args: argparse.Namespace, outputs_dir: Path) -> Datase
 def validate_training_args(args: argparse.Namespace) -> None:
     register_builtin_components()
     get_method(args.method)
-    if args.method not in {"source_only", "adabn"}:
-        raise ValueError("Only method='source_only' and method='adabn' are implemented; no other SFDA methods are available yet.")
+    if args.method not in {"source_only", "adabn", "shot_im"}:
+        raise ValueError(
+            "Only method='source_only', method='adabn', and method='shot_im' are implemented; "
+            "no other SFDA methods are available yet."
+        )
     if args.method == "source_only" and args.adaptation_protocol != "none":
         raise ValueError("source_only requires adaptation_protocol='none'.")
     if args.method == "source_only" and args.reuse_source:
         raise ValueError("--reuse-source is only valid for adaptation methods such as --method adabn")
-    if args.method == "adabn" and args.adaptation_protocol != "transductive":
-        raise ValueError("AdaBN requires adaptation_protocol='transductive'.")
+    if args.method in ADAPTATION_METHODS and args.adaptation_protocol != "transductive":
+        raise ValueError(f"{args.method} requires adaptation_protocol='transductive'.")
     if args.reuse_source and args.method != "source_only" and args.source_manifest is None and args.source_checkpoint_dir is None:
         raise ValueError("--reuse-source requires --source-manifest or --source-checkpoint-dir")
     if args.adabn_num_passes <= 0:
         raise ValueError("--adabn-num-passes must be positive")
+    if args.shot_epochs <= 0:
+        raise ValueError("--shot-epochs must be positive")
+    if args.shot_lr <= 0:
+        raise ValueError("--shot-lr must be positive")
+    if args.shot_weight_decay < 0:
+        raise ValueError("--shot-weight-decay must be non-negative")
+    if args.shot_entropy_weight < 0 or args.shot_diversity_weight < 0:
+        raise ValueError("SHOT-IM loss weights must be non-negative")
+    if args.shot_grad_clip_norm < 0:
+        raise ValueError("--shot-grad-clip-norm must be non-negative")
+    if args.shot_log_interval <= 0:
+        raise ValueError("--shot-log-interval must be positive")
     if args.epochs <= 0:
         raise ValueError("--epochs must be positive")
     if args.batch_size <= 0:
@@ -1097,14 +1133,14 @@ def run_loso_fold(
         },
         "final_metrics": serializable_metrics(test_metrics),
     }
-    adabn_checkpoint_path = adapted_checkpoint_path(plan, "adabn")
-    adabn_report = None
-    if args.method == "adabn":
-        adabn_report = {
+    method_checkpoint_path = adapted_checkpoint_path(plan, args.method)
+    method_report = None
+    if args.method in ADAPTATION_METHODS:
+        method_report = {
             **method_diagnostics,
-            "method": "adabn",
+            "method": args.method,
             "source_checkpoint_path": str(plan.checkpoint_path),
-            "adapted_checkpoint_path": str(adabn_checkpoint_path),
+            "adapted_checkpoint_path": str(method_checkpoint_path),
             "target_subject": plan.target_subject,
             "target_subject_raw": plan.target_subject_raw,
             "adaptation_protocol": args.adaptation_protocol,
@@ -1129,29 +1165,35 @@ def run_loso_fold(
             selected_epoch=selected_epoch,
             selected_reason=selected_reason,
         )
-        if args.method == "adabn":
-            adabn_report["source_checkpoint_path"] = str(source_ckpt_path)
-            adabn_report["adapted_checkpoint_path"] = str(adabn_checkpoint_path) if args.save_adapted_checkpoint else ""
+        if args.method in ADAPTATION_METHODS and method_report is not None:
+            method_report["source_checkpoint_path"] = str(source_ckpt_path)
+            method_report["adapted_checkpoint_path"] = str(method_checkpoint_path) if args.save_adapted_checkpoint else ""
             adapted_checkpoint = {
                 **checkpoint,
                 "model_state_dict": engine_checkpointing.copy_model_state(model),
                 "source_checkpoint_path": str(source_ckpt_path),
-                "adapted_checkpoint_path": str(adabn_checkpoint_path),
-                "adabn_report": adabn_report,
+                "adapted_checkpoint_path": str(method_checkpoint_path),
+                "adaptation_report": method_report,
             }
             if args.save_adapted_checkpoint:
-                torch.save(adapted_checkpoint, adabn_checkpoint_path)
-            write_json(adabn_report_path(plan), adabn_report)
+                torch.save(adapted_checkpoint, method_checkpoint_path)
+            report_path = adaptation_report_path(plan, args.method)
+            history = method_report.get("loss_history")
+            if isinstance(history, list) and history:
+                history_path = fold_artifact_dir(plan) / f"{args.method}_adaptation_history.csv"
+                pd.DataFrame(history).to_csv(history_path, index=False)
+                method_report["adaptation_history_path"] = str(history_path)
+            write_json(report_path, method_report)
             write_adaptation_manifest_row(
                 adaptation_manifest_path(plan),
                 args,
                 plan,
                 source_checkpoint_path=source_ckpt_path,
-                adapted_checkpoint_path_value=adabn_checkpoint_path if args.save_adapted_checkpoint else None,
+                adapted_checkpoint_path_value=method_checkpoint_path if args.save_adapted_checkpoint else None,
                 prediction_path=method_prediction_path,
                 metrics_path=method_metrics_path,
-                adaptation_report_path=adabn_report_path(plan),
-                target_samples_used=int(adabn_report.get("target_samples_used", 0)),
+                adaptation_report_path=report_path,
+                target_samples_used=int(method_report.get("target_samples_used", 0)),
             )
         if plan.latest_checkpoint_path is not None:
             plan.latest_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1194,19 +1236,19 @@ def run_loso_fold(
                 "final_metrics": serializable_metrics(test_metrics),
             }
         )
-        if args.method == "adabn" and adabn_report is not None:
+        if args.method in ADAPTATION_METHODS and method_report is not None:
             fold_audit.update(
                 {
                     "adaptation_protocol": args.adaptation_protocol,
                     "target_unlabeled_used_for_adaptation": True,
-                    "target_bn_stats_recomputed_on_target": bool(adabn_report.get("bn_running_stats_changed")),
+                    "target_bn_stats_recomputed_on_target": bool(method_report.get("bn_running_stats_changed")),
                     "target_labels_used_for_adaptation": False,
                     "target_labels_used_for_model_selection": False,
                     "target_labels_used_for_evaluation_only": True,
                     "adaptation_eval_split": "same_as_adaptation",
-                    "adaptation_report_path": str(adabn_report_path(plan)),
-                    "adapted_checkpoint_path": str(adabn_checkpoint_path),
-                    "adaptation": adabn_report,
+                    "adaptation_report_path": str(adaptation_report_path(plan, args.method)),
+                    "adapted_checkpoint_path": str(method_checkpoint_path),
+                    "adaptation": method_report,
                 }
             )
         save_fold_audit(plan, fold_audit)
@@ -1320,12 +1362,13 @@ def run_reuse_source_fold(
         fold_dir = fold_artifact_dir(plan)
         fold_dir.mkdir(parents=True, exist_ok=True)
         (fold_dir / "source_checkpoint_used.txt").write_text(str(source_checkpoint) + "\n", encoding="utf-8")
-        adabn_ckpt_path = adapted_checkpoint_path(plan, args.method)
-        adabn_report = {
+        method_ckpt_path = adapted_checkpoint_path(plan, args.method)
+        method_report_path = adaptation_report_path(plan, args.method)
+        method_report = {
             **method_diagnostics,
             "method": args.method,
             "source_checkpoint_path": str(source_checkpoint),
-            "adapted_checkpoint_path": str(adabn_ckpt_path) if args.save_adapted_checkpoint else "",
+            "adapted_checkpoint_path": str(method_ckpt_path) if args.save_adapted_checkpoint else "",
             "target_subject": plan.target_subject,
             "target_subject_raw": plan.target_subject_raw,
             "adaptation_protocol": args.adaptation_protocol,
@@ -1335,19 +1378,24 @@ def run_reuse_source_fold(
             "target_labels_used_for_evaluation_only": True,
         }
         if args.save_adapted_checkpoint:
-            adabn_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+            method_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
                 {
                     **checkpoint,
                     "model_state_dict": engine_checkpointing.copy_model_state(model),
                     "source_checkpoint_path": str(source_checkpoint),
-                    "adapted_checkpoint_path": str(adabn_ckpt_path),
-                    "adabn_report": adabn_report,
+                    "adapted_checkpoint_path": str(method_ckpt_path),
+                    "adaptation_report": method_report,
                 },
-                adabn_ckpt_path,
+                method_ckpt_path,
             )
-        write_json(adabn_report_path(plan), adabn_report)
-        write_json(fold_dir / "adaptation_report.json", adabn_report)
+        history = method_report.get("loss_history")
+        if isinstance(history, list) and history:
+            history_path = fold_dir / f"{args.method}_adaptation_history.csv"
+            pd.DataFrame(history).to_csv(history_path, index=False)
+            method_report["adaptation_history_path"] = str(history_path)
+        write_json(method_report_path, method_report)
+        write_json(fold_dir / "adaptation_report.json", method_report)
         save_success_summary_row(
             plan.summary_path,
             args=args,
@@ -1375,11 +1423,11 @@ def run_reuse_source_fold(
             args,
             plan,
             source_checkpoint_path=source_checkpoint,
-            adapted_checkpoint_path_value=adabn_ckpt_path if args.save_adapted_checkpoint else None,
+            adapted_checkpoint_path_value=method_ckpt_path if args.save_adapted_checkpoint else None,
             prediction_path=method_prediction_path,
             metrics_path=method_metrics_path,
-            adaptation_report_path=adabn_report_path(plan),
-            target_samples_used=int(adabn_report.get("target_samples_used", 0)),
+            adaptation_report_path=method_report_path,
+            target_samples_used=int(method_report.get("target_samples_used", 0)),
         )
         save_fold_reporting(args, plan, test_metrics, selected_epoch, selected_reason)
         fold_audit = {
@@ -1412,14 +1460,14 @@ def run_reuse_source_fold(
             "final_metrics": serializable_metrics(test_metrics),
             "adaptation_protocol": args.adaptation_protocol,
             "target_unlabeled_used_for_adaptation": True,
-            "target_bn_stats_recomputed_on_target": bool(adabn_report.get("bn_running_stats_changed")),
+            "target_bn_stats_recomputed_on_target": bool(method_report.get("bn_running_stats_changed")),
             "target_labels_used_for_adaptation": False,
             "target_labels_used_for_model_selection": False,
             "target_labels_used_for_evaluation_only": True,
             "adaptation_eval_split": "same_as_adaptation",
-            "adaptation_report_path": str(adabn_report_path(plan)),
-            "adapted_checkpoint_path": str(adabn_ckpt_path) if args.save_adapted_checkpoint else "",
-            "adaptation": adabn_report,
+            "adaptation_report_path": str(method_report_path),
+            "adapted_checkpoint_path": str(method_ckpt_path) if args.save_adapted_checkpoint else "",
+            "adaptation": method_report,
         }
         save_fold_audit(plan, fold_audit)
         update_aggregate_metrics_report(plan)
@@ -1777,8 +1825,12 @@ def split_audit_report_path(plan: FoldPlan) -> Path:
     return run_dir(plan) / "split_audit" / f"fold_{plan.target_subject}.json"
 
 
+def adaptation_report_path(plan: FoldPlan, method_name: str) -> Path:
+    return run_dir(plan) / "reports" / f"{method_name}_report_subject_{plan.target_subject}.json"
+
+
 def adabn_report_path(plan: FoldPlan) -> Path:
-    return run_dir(plan) / "reports" / f"adabn_report_subject_{plan.target_subject}.json"
+    return adaptation_report_path(plan, "adabn")
 
 
 def adapted_checkpoint_path(plan: FoldPlan, method_name: str) -> Path:
@@ -1862,6 +1914,16 @@ def write_run_reports(
                 "momentum": args.adabn_momentum,
                 "num_passes": args.adabn_num_passes,
             },
+            "shot_im": {
+                "epochs": args.shot_epochs,
+                "lr": args.shot_lr,
+                "weight_decay": args.shot_weight_decay,
+                "entropy_weight": args.shot_entropy_weight,
+                "diversity_weight": args.shot_diversity_weight,
+                "freeze_classifier": args.shot_freeze_classifier,
+                "grad_clip_norm": args.shot_grad_clip_norm,
+                "log_interval": args.shot_log_interval,
+            },
             "label_protocol": context.label_protocol,
             "input_channels": context.input_channels,
             "input_samples": context.input_samples,
@@ -1895,7 +1957,7 @@ def write_run_reports(
             "early_stop_enabled": early_stop_enabled(args),
             "monitor_metric": args.monitor_metric,
             "target_labels_for_model_selection": False,
-            "target_unlabeled_used_for_adaptation": args.method == "adabn",
+            "target_unlabeled_used_for_adaptation": args.method in ADAPTATION_METHODS,
             "target_bn_stats_recomputed_on_target": args.method == "adabn",
             "target_labels_used_for_adaptation": False,
             "target_labels_used_for_model_selection": False,
@@ -1917,7 +1979,7 @@ def print_run_overview(
     print("EEGDA Benchmark Run")
     print("-" * 21)
     print(f"Dataset        : {context.dataset}")
-    method_label = "source-only" if args.method == "source_only" else "AdaBN source-free"
+    method_label = method_display_label(args.method)
     print(f"Protocol       : LOSO {method_label}")
     print(f"Model          : {'EEGNet' if context.model_name == 'eegnet' else context.model_name}")
     print(f"Subjects       : {len(context.subjects)} available, {len(target_subjects)} selected")
@@ -1941,6 +2003,11 @@ def print_run_overview(
         print("[OK] AdaBN uses unlabeled target data only and updates BatchNorm running statistics only.")
         if args.reuse_source:
             print("[OK] Source training is skipped; fold source checkpoints are loaded from the source manifest.")
+    if args.method == "shot_im":
+        print("[OK] SHOT-IM uses unlabeled target data only and freezes the classifier by default.")
+        print("[OK] Target labels are not used for SHOT-IM loss, adaptation, checkpointing, or model selection.")
+        if args.reuse_source:
+            print("[OK] Source training is skipped; fold source checkpoints are loaded from the source manifest.")
     if args.validation_mode == "none":
         print(f"[WARN] No validation set is used; checkpoint_policy={args.checkpoint_policy} will be used.")
     if args.dataset != "seedvig" and getattr(args, "label_mode_explicit", False):
@@ -1955,6 +2022,16 @@ def format_selected_targets(context: DatasetContext, target_subjects: list[int])
         f"{subject}(raw={context.subject_mapping.get(subject, subject)})"
         for subject in target_subjects
     )
+
+
+def method_display_label(method_name: str) -> str:
+    if method_name == "source_only":
+        return "source-only"
+    if method_name == "adabn":
+        return "AdaBN source-free"
+    if method_name == "shot_im":
+        return "SHOT-IM source-free"
+    return method_name
 
 
 def loss_label(args: argparse.Namespace) -> str:
@@ -2179,6 +2256,14 @@ def training_config(args: argparse.Namespace) -> dict[str, object]:
         "adabn_reset_stats": args.adabn_reset_stats,
         "adabn_momentum": args.adabn_momentum,
         "adabn_num_passes": args.adabn_num_passes,
+        "shot_epochs": args.shot_epochs,
+        "shot_lr": args.shot_lr,
+        "shot_weight_decay": args.shot_weight_decay,
+        "shot_entropy_weight": args.shot_entropy_weight,
+        "shot_diversity_weight": args.shot_diversity_weight,
+        "shot_freeze_classifier": args.shot_freeze_classifier,
+        "shot_grad_clip_norm": args.shot_grad_clip_norm,
+        "shot_log_interval": args.shot_log_interval,
         "min_delta": args.min_delta,
         "monitor_metric": args.monitor_metric,
     }
@@ -2525,12 +2610,13 @@ def fold_artifacts(plan: FoldPlan) -> dict[str, str]:
         "epoch_metrics_path": str(epoch_metrics_report_path(plan)),
         "fold_audit_path": str(split_audit_report_path(plan)),
     }
-    adabn_ckpt = adapted_checkpoint_path(plan, "adabn")
-    adabn_report = adabn_report_path(plan)
-    if adabn_ckpt.exists():
-        artifacts["adapted_checkpoint_path"] = str(adabn_ckpt)
-    if adabn_report.exists():
-        artifacts["adabn_report_path"] = str(adabn_report)
+    for method_name in ADAPTATION_METHODS:
+        method_ckpt = adapted_checkpoint_path(plan, method_name)
+        method_report = adaptation_report_path(plan, method_name)
+        if method_ckpt.exists():
+            artifacts[f"{method_name}_adapted_checkpoint_path"] = str(method_ckpt)
+        if method_report.exists():
+            artifacts[f"{method_name}_report_path"] = str(method_report)
     return artifacts
 
 
@@ -2884,7 +2970,9 @@ def write_checkpoint_manifest_row(
         "normalization_stats_path": str(normalization_stats_path(plan)),
         "split_info_path": str(split_info_path(plan)),
         "class_weights_path": str(class_weights_path(plan)),
-        "adapted_checkpoint_path": str(adapted_checkpoint_path(plan, "adabn")) if args.method == "adabn" else "",
+        "adapted_checkpoint_path": (
+            str(adapted_checkpoint_path(plan, args.method)) if args.method in ADAPTATION_METHODS else ""
+        ),
         "prediction_csv_path": str(plan.prediction_path),
         "summary_path": str(plan.summary_path),
         "command": plan.command,
